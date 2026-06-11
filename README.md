@@ -1,5 +1,9 @@
 # Packet Highway
 
+<a href="https://youtu.be/oALYgxMnnMw" target="_blank">
+  <img src="https://img.youtube.com/vi/oALYgxMnnMw/maxresdefault.jpg" alt="Watch the video" width="600" />
+</a>
+
 **A 3D network traffic visualizer.** Packets become vehicles on a divided highway:
 inbound traffic drives one way, outbound the other, and each lane carries a class
 of service (web, DNS, management, infrastructure, file transfer…). Watch your
