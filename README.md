@@ -55,6 +55,20 @@ lane is two files of traffic); when both files are occupied, the burst rides
 as a **convoy** (log-scaled by packet count — engineers think in orders of
 magnitude). UDP drones are airborne and separate by altitude instead.
 
+### DNS health
+
+DNS gets the same treatment as TCP: queries are matched to responses by
+transaction id, and the panel tracks **resolved / NXDOMAIN / SERVFAIL /
+timeouts** plus median lookup latency. Failed lookups ride as **red
+motorcycles**, and shoulder flares stack per failing *name* (NXDOMAIN) or
+per *resolver* (SERVFAIL/timeout) — one broken domain = one growing stack.
+Multicast discovery queries (mDNS/SSDP) are exempt from timeout tracking
+(they're unanswered by design); broadcast/multicast frames are counted in the
+dashboard and a storm warning fires if they exceed 50/s. In PCAP mode the
+scrubber histogram is **stacked by lane** (same colors as the road) with
+red/amber **tick marks at RSTs and DNS failures** — scrub straight to the
+anomaly.
+
 ### TCP telemetry
 
 Beyond the failure counters, the flow tracker passively measures **handshake

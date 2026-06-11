@@ -2,7 +2,7 @@
 // packet/convoy/flare detail panel, playback bar, toasts. Pure view layer —
 // main.js supplies callbacks. The legend is generated from config.js so its
 // colors are, by construction, the colors used on the road.
-import { FLAG_NAMES, LEGEND, PROTO_CSS } from './config.js';
+import { FLAG_NAMES, LEGEND, PROTO_CSS, isBroadcast } from './config.js';
 import { drawHistogram, drawSparkline } from './histogram.js';
 import { fmtBps, fmtBytes } from './stats.js';
 
@@ -51,6 +51,7 @@ export class UI {
       'hud-merged', 'hud-recycled', 'hud-dropped',
       'tcph-est', 'tcph-pending', 'tcph-half', 'tcph-refused', 'tcph-rst',
       'tcph-retries', 'tcph-rtt', 'tcph-bar',
+      'dnsh-ok', 'dnsh-nx', 'dnsh-sf', 'dnsh-to', 'dnsh-rtt',
       'detail-panel', 'detail-body', 'detail-close', 'playback-bar', 'btn-play',
       'sel-speed', 'time-cur', 'time-total', 'time-abs', 'scrub', 'hist-canvas',
       'toasts',
@@ -90,7 +91,7 @@ export class UI {
   buildLegend() {
     const rows = LEGEND.map((l) => `
       <div><i class="inline-block w-2.5 h-2.5 rounded-sm mr-1.5 align-middle"
-              style="background:${PROTO_CSS[l.proto]}"></i>${esc(l.text)}</div>`);
+              style="background:${l.css ?? PROTO_CSS[l.proto]}"></i>${esc(l.text)}</div>`);
     rows.push(`
       <div class="mt-1 text-slate-400">⚡ Strobes on gray cars = TCP control:
         <span class="text-amber-300">SYN</span> ·
@@ -160,10 +161,12 @@ export class UI {
     drawHistogram(this.el['hist-canvas'], this.histBuckets, pb.progress);
   }
 
-  renderStats(s, flow) {
+  renderStats(s, flow, dns) {
     this.el['stat-bw-in'].textContent = fmtBps(s.bpsIn);
     this.el['stat-bw-out'].textContent = fmtBps(s.bpsOut);
-    this.el['stat-total'].textContent = `${s.totalPkts.toLocaleString()} pkts · ${fmtBytes(s.totalBytes)}`;
+    this.el['stat-total'].textContent =
+      `${s.totalPkts.toLocaleString()} pkts · ${fmtBytes(s.totalBytes)}`
+      + (s.bcastWin > 0 ? ` · ${s.bcastWin.toLocaleString()} bcast` : '');
     drawSparkline(this.el['spark-canvas'], s.buckets);
 
     this.el['proto-list'].innerHTML = s.protoDist.slice(0, 8).map((p) => `
@@ -201,6 +204,14 @@ export class UI {
       const okFrac = attempts ? c.established / attempts : 1;
       this.el['tcph-bar'].style.width = `${(okFrac * 100).toFixed(1)}%`;
       this.el['tcph-bar'].className = `h-full rounded-full ${okFrac > 0.9 ? 'bg-emerald-500' : okFrac > 0.6 ? 'bg-amber-500' : 'bg-red-500'}`;
+    }
+    if (dns) {
+      const d = dns.counts;
+      this.el['dnsh-ok'].textContent = d.ok.toLocaleString();
+      this.el['dnsh-nx'].textContent = d.nxdomain.toLocaleString();
+      this.el['dnsh-sf'].textContent = d.servfail.toLocaleString();
+      this.el['dnsh-to'].textContent = d.timeouts.toLocaleString();
+      this.el['dnsh-rtt'].textContent = dns.rtt ? `${dns.rtt.med.toFixed(0)} ms` : '—';
     }
   }
 
@@ -245,11 +256,15 @@ export class UI {
       ? p.flags.split('').map((f) => FLAG_NAMES[f] ?? f).join(' + ')
       : '—';
     const protoColor = PROTO_CSS[p.proto] ?? '#64748b';
+    const dnsRow = p.dns_qr != null
+      ? this.row('DNS', esc(`${p.dns_qr === 0 ? 'query' : 'response'}${p.dns_qname ? ' · ' + p.dns_qname : ''}${p.dns_qr === 1 ? ' · ' + ({ 0: 'NOERROR', 2: 'SERVFAIL', 3: 'NXDOMAIN' }[p.dns_rcode] ?? 'rcode ' + p.dns_rcode) : ''}`))
+      : '';
     return `
       <div class="flex items-center gap-2 mb-2 flex-wrap">
         <span class="badge" style="background:${protoColor}22;color:${protoColor}">${esc(p.proto)}</span>
         ${this.dirBadge(p.dir)}
         <span class="badge bg-slate-700/60 text-slate-300">${esc(p.transport)}</span>
+        ${isBroadcast(p) ? '<span class="badge bg-amber-500/20 text-amber-300">📢 BROADCAST</span>' : ''}
       </div>
       ${this.row('Timestamp', esc(fmtTime(p.ts)))}
       ${this.row('Epoch', esc(p.ts.toFixed(6)))}
@@ -261,6 +276,7 @@ export class UI {
       ${this.row('TTL', esc(p.ttl ?? '—'))}
       ${this.row('TCP flags', esc(flagStr))}
       ${p.icmp_type != null ? this.row('ICMP', esc(icmpName(p))) : ''}
+      ${dnsRow}
       ${this.row('Packet #', esc('#' + p.id))}
     `;
   }
@@ -291,6 +307,7 @@ export class UI {
   }
 
   flowDetail(m) {
+    if (m.dns) return this.dnsDetail(m);
     const p = m.syn;
     const refused = m.flowEvent === 'refused';
     const title = refused
@@ -310,6 +327,33 @@ export class UI {
       ${m.rst ? this.row('Refused after', esc(`${((m.rst.ts - p.ts) * 1000).toFixed(1)} ms`)) : ''}
       ${this.row('Source MAC', esc(p.smac))}
       ${this.row('TTL', esc(p.ttl ?? '—'))}
+    `;
+  }
+
+  dnsDetail(m) {
+    const q = m.query, r = m.resp;
+    const ref = q ?? r;
+    const kinds = {
+      nxdomain: ['<span class="badge bg-red-500/20 text-red-300">⛔ NXDOMAIN</span>',
+        'The name does not exist. Typo, dead domain, or a broken search suffix appending garbage.'],
+      servfail: ['<span class="badge bg-red-500/20 text-rose-300">⛔ SERVFAIL</span>',
+        'The resolver could not answer — upstream unreachable, DNSSEC validation failure, or a lame delegation.'],
+      dnstimeout: ['<span class="badge bg-amber-500/20 text-amber-300">⚠ DNS TIMEOUT</span>',
+        'The resolver never answered. Resolver down, UDP/53 blocked, or severe packet loss.'],
+    };
+    const [title, hint] = kinds[m.flowEvent] ?? ['DNS event', ''];
+    const qname = r?.dns_qname ?? q?.dns_qname;
+    return `
+      <div class="flex items-center gap-2 mb-2 flex-wrap">${title} ${this.dirBadge(ref.dir)}</div>
+      <p class="text-slate-400 mb-2">${hint}</p>
+      ${m.attempts > 1 ? this.row('Occurrences', esc(`×${m.attempts}`)) : ''}
+      ${qname ? this.row('Name', esc(qname)) : ''}
+      ${q ? this.row('Query sent', esc(fmtTime(q.ts))) : ''}
+      ${r ? this.row('Answered', esc(fmtTime(r.ts))) : ''}
+      ${q && r ? this.row('Lookup time', esc(`${((r.ts - q.ts) * 1000).toFixed(1)} ms`)) : ''}
+      ${this.row('Client', q ? `${esc(q.src)}:${esc(q.sport)}` : '—')}
+      ${this.row('Resolver', esc(q ? q.dst : r?.src))}
+      ${this.row('Txn id', esc(ref.dns_id ?? '—'))}
     `;
   }
 

@@ -139,6 +139,26 @@ export const FLAG_NAMES = {
   F: 'FIN', S: 'SYN', R: 'RST', P: 'PSH', A: 'ACK', U: 'URG', E: 'ECE', C: 'CWR',
 };
 
+// Failure tint shared by DNS-failure motorcycles and ICMP error cruisers.
+export const FAIL_RED = 0xef4444;
+
+// Representative color per lane, for the stacked scrubber histogram.
+export const LANE_REPR = {
+  WEB: PROTO_COLORS.HTTPS, DNS: PROTO_COLORS.DNS, MGMT: PROTO_COLORS.SSH,
+  INFRA: PROTO_COLORS.SNMP, FILE: PROTO_COLORS.SMB, OTHER: PROTO_COLORS.TCP,
+  ICMP: PROTO_COLORS.ICMP,
+};
+
+/** Broadcast / multicast destination (L2 or L3). */
+export function isBroadcast(p) {
+  if (p.dmac === 'ff:ff:ff:ff:ff:ff') return true;
+  const d = p.dst ?? '';
+  if (d === '255.255.255.255') return true;
+  const first = parseInt(d, 10);
+  if (first >= 224 && first <= 239) return true;
+  return d.includes(':') && d.toLowerCase().startsWith('ff');
+}
+
 // Rows for the auto-generated legend (color always = PROTO_COLORS).
 export const LEGEND = [
   { proto: 'DNS',   text: 'DNS — motorcycles (fast lane)' },
@@ -153,4 +173,5 @@ export const LEGEND = [
   { proto: 'UDP',   text: 'Other UDP — drones (airborne)' },
   { proto: 'TCP',   text: 'Other TCP — sedans' },
   { proto: 'ARP',   text: 'ARP/L2 — maintenance carts' },
+  { css: '#ef4444', text: 'Red bodies = failures (NXDOMAIN/SERVFAIL bikes, ICMP errors)' },
 ];

@@ -9,6 +9,7 @@ import { TrafficController } from './traffic.js';
 import { Picker } from './picking.js';
 import { StatsEngine } from './stats.js';
 import { FlowTracker } from './flows.js';
+import { DnsTracker } from './dns.js';
 import { Playback } from './playback.js';
 import { LiveSource, fetchInterfaces, fetchSample, uploadPcap } from './sources.js';
 import { computeBuckets } from './histogram.js';
@@ -20,10 +21,12 @@ const laneX = buildHighway(scene);
 const traffic = new TrafficController(scene, laneX);
 const stats = new StatsEngine(60);
 const flows = new FlowTracker(3);
+const dns = new DnsTracker(5);
 const playback = new Playback();
 
 let mode = 'live';
 let liveDropped = 0;
+let lastStormWarn = -1e9;
 
 function ingestPacket(p) {
   traffic.ingest(p);
@@ -34,12 +37,15 @@ function trackPacket(p) {
   stats.add(p);
   const ev = flows.add(p);
   if (ev) traffic.spawnFlare(ev);
+  const dnsEv = dns.add(p);
+  if (dnsEv) traffic.spawnDnsFlare(dnsEv);
 }
 
 function resetWorld() {
   traffic.clear();
   stats.reset();
   flows.reset();
+  dns.reset();
   liveDropped = 0;
   picker.deselect();
 }
@@ -181,12 +187,20 @@ function step(now, render) {
     uiTimer = 0;
     const statsNow = mode === 'pcap' ? (playback.loaded ? playback.t : 0) : Date.now() / 1000;
     for (const ev of flows.tick(statsNow)) traffic.spawnFlare(ev);
+    for (const ev of dns.tick(statsNow)) traffic.spawnDnsFlare(ev);
     const snap = stats.snapshot(statsNow);
     ui.renderStats(snap, {
       counts: flows.counts,
       pending: flows.pendingCount,
       rtt: flows.rttStats,
+    }, {
+      counts: dns.counts,
+      rtt: dns.rttStats,
     });
+    if (snap.bcastPps > 50 && statsNow - lastStormWarn > 30) {
+      lastStormWarn = statsNow;
+      ui.toast(`Broadcast storm? ${snap.bcastPps}/s broadcast-multicast frames in the last second.`, 'error');
+    }
     ui.hud({
       fps,
       active: traffic.activeCount(),

@@ -34,23 +34,31 @@ ROUTER_IP = "192.168.1.1"
 NAS_IP = "192.168.1.20"
 RDP_HOST = "203.0.113.40"
 
+OK_NAMES = [
+    "example.com", "github.com", "cdn.shopfast.net", "api.weather.io",
+    "updates.win-svc.com", "img.newsfeed.org", "auth.cloudid.net",
+    "static.vidstream.tv", "mail.corpbox.com", "tiles.mapper.app",
+]
+BAD_NAMES = ["githib.com", "exmaple.cmo", "old-service.internal", "dead.startup.app"]
+
 
 # LAN devices have their own MACs; external hosts arrive via the gateway's.
 _MAC_BY_IP = {HOME_IP: HOME_MAC, "192.168.1.20": NAS_MAC, "192.168.1.1": GW_MAC}
 
 
-def _make_event(ts, src, dst, sport, dport, transport, size, flags, rng, ttl_map):
+def _make_event(ts, src, dst, sport, dport, transport, size, flags, rng, ttl_map, dns=None):
     out = src == HOME_IP
     # one TTL per host per generation run — a flow's TTL never jitters
     if src not in ttl_map:
         ttl_map[src] = 64 if src in _MAC_BY_IP else rng.choice((49, 52, 55, 57, 59, 61, 113, 118, 243))
     icmp = transport == "ICMP"
+    multicast = dst.startswith(("224.", "239.")) or dst == "255.255.255.255"
     return {
         "ts": ts,
         "src": src,
         "dst": dst,
         "smac": _MAC_BY_IP.get(src, GW_MAC),
-        "dmac": _MAC_BY_IP.get(dst, GW_MAC),
+        "dmac": "01:00:5e:7f:ff:fa" if multicast else _MAC_BY_IP.get(dst, GW_MAC),
         "sport": sport,
         "dport": dport,
         "transport": transport,
@@ -60,6 +68,10 @@ def _make_event(ts, src, dst, sport, dport, transport, size, flags, rng, ttl_map
         "ttl": ttl_map[src],
         "icmp_type": (8 if out else 0) if icmp else None,
         "icmp_code": 0 if icmp else None,
+        "dns_id": dns["id"] if dns else None,
+        "dns_qr": dns["qr"] if dns else None,
+        "dns_rcode": dns.get("rcode", 0) if dns else None,
+        "dns_qname": dns.get("qname") if dns else None,
         "dir": "out" if out else "in",
     }
 
@@ -69,18 +81,27 @@ def gen_events(t0: float, duration: float, rng: random.Random) -> list[dict]:
     ev: list[dict] = []
     ttl_map: dict[str, int] = {}
 
-    def _ev(ts, src, dst, sport, dport, transport, size, flags=""):
-        return _make_event(ts, src, dst, sport, dport, transport, size, flags, rng, ttl_map)
+    def _ev(ts, src, dst, sport, dport, transport, size, flags="", dns=None):
+        return _make_event(ts, src, dst, sport, dport, transport, size, flags, rng, ttl_map, dns)
+
+    def dns_pair(t, qname=None, rcode=0, answered=True):
+        """A DNS lookup: query out, (optionally) response back."""
+        server = rng.choice(DNS_SERVERS)
+        qp = rng.randint(49152, 65000)
+        did = rng.randint(0, 65535)
+        qname = qname or rng.choice(OK_NAMES)
+        ev.append(_ev(t, HOME_IP, server, qp, 53, "UDP", rng.randint(64, 96),
+                      dns={"id": did, "qr": 0, "qname": qname}))
+        if answered:
+            ev.append(_ev(t + rng.uniform(0.012, 0.07), server, HOME_IP, 53, qp, "UDP",
+                          rng.randint(96, 280),
+                          dns={"id": did, "qr": 1, "rcode": rcode, "qname": qname}))
 
     def web_session(t: float):
         srv = rng.choice(WEB_HOSTS)
         cport = rng.randint(49152, 65000)
         port = 443 if rng.random() < 0.85 else 80
-        # DNS lookup first
-        dns = rng.choice(DNS_SERVERS)
-        qp = rng.randint(49152, 65000)
-        ev.append(_ev(t, HOME_IP, dns, qp, 53, "UDP", rng.randint(64, 96)))
-        ev.append(_ev(t + rng.uniform(0.012, 0.07), dns, HOME_IP, 53, qp, "UDP", rng.randint(96, 280)))
+        dns_pair(t)  # lookup precedes the connection
         # TCP handshake
         t2 = t + rng.uniform(0.06, 0.16)
         rtt = rng.uniform(0.012, 0.06)
@@ -107,11 +128,21 @@ def gen_events(t0: float, duration: float, rng: random.Random) -> list[dict]:
             ev.append(_ev(tr + rng.uniform(0.05, 0.2), srv, HOME_IP, port, cport, "TCP", 60, "R"))
 
     def dns_only(t: float):
-        dns = rng.choice(DNS_SERVERS)
-        qp = rng.randint(49152, 65000)
-        ev.append(_ev(t, HOME_IP, dns, qp, 53, "UDP", rng.randint(64, 110)))
-        if rng.random() < 0.95:
-            ev.append(_ev(t + rng.uniform(0.01, 0.09), dns, HOME_IP, 53, qp, "UDP", rng.randint(90, 420)))
+        dns_pair(t)
+
+    def dns_fail(t: float):
+        r = rng.random()
+        if r < 0.5:    # typo / dead name
+            dns_pair(t, qname=rng.choice(BAD_NAMES), rcode=3)
+        elif r < 0.8:  # resolver/upstream failure
+            dns_pair(t, rcode=2)
+        else:          # resolver never answers
+            dns_pair(t, answered=False)
+
+    def ssdp_noise(t: float):
+        # discovery multicast chatter (SSDP)
+        ev.append(_ev(t, HOME_IP, "239.255.255.250", rng.randint(49152, 65000),
+                      1900, "UDP", rng.randint(130, 380)))
 
     def ssh_chatter(t: float):
         cp = rng.randint(49152, 65000)
@@ -206,11 +237,11 @@ def gen_events(t0: float, duration: float, rng: random.Random) -> list[dict]:
             if rng.random() < 0.7:
                 ev.append(_ev(tt + rng.uniform(0.001, 0.01), HOME_IP, scanner, dp, sp, "TCP", 60, "RA"))
 
-    actions = [(web_session, 0.32), (dns_only, 0.12), (ping, 0.06),
-               (ssh_chatter, 0.07), (udp_noise, 0.12), (tcp_noise, 0.05),
+    actions = [(web_session, 0.30), (dns_only, 0.11), (ping, 0.06),
+               (ssh_chatter, 0.07), (udp_noise, 0.11), (tcp_noise, 0.05),
                (smb_burst, 0.08), (snmp_poll, 0.07), (rdp_session, 0.04),
                (dhcp_renew, 0.02), (filtered_syn, 0.02), (refused_conn, 0.02),
-               (scan_burst, 0.01)]
+               (scan_burst, 0.01), (dns_fail, 0.03), (ssdp_noise, 0.01)]
     t = t0
     end = t0 + duration
     while t < end:
@@ -261,6 +292,7 @@ def build_sample_pcap_bytes(duration: float = 90.0, seed: int = 7) -> bytes:
         if cached is not None:
             return cached
 
+        from scapy.layers.dns import DNS, DNSQR, DNSRR
         from scapy.layers.inet import ICMP, IP, TCP, UDP
         from scapy.layers.l2 import Ether
         from scapy.packet import Raw
@@ -273,16 +305,27 @@ def build_sample_pcap_bytes(duration: float = 90.0, seed: int = 7) -> bytes:
         for e in events:
             eth = Ether(src=e["smac"], dst=e["dmac"])
             ip = IP(src=e["src"], dst=e["dst"], ttl=e["ttl"])
+            pad_to_size = True
             if e["transport"] == "TCP":
                 l4 = TCP(sport=e["sport"], dport=e["dport"], flags=e["flags"] or "PA")
             elif e["transport"] == "UDP":
                 l4 = UDP(sport=e["sport"], dport=e["dport"])
+                if e.get("dns_id") is not None:
+                    # real DNS header so the parser round-trip exercises it
+                    qd = DNSQR(qname=e["dns_qname"] or "example.com")
+                    if e["dns_qr"] == 0:
+                        l4 = l4 / DNS(id=e["dns_id"], qr=0, rd=1, qd=qd)
+                    else:
+                        an = DNSRR(rrname=qd.qname, rdata="93.184.216.34") if e["dns_rcode"] == 0 else None
+                        l4 = l4 / DNS(id=e["dns_id"], qr=1, rcode=e["dns_rcode"], qd=qd, an=an)
+                    pad_to_size = False  # the DNS payload defines the size
             else:
                 l4 = ICMP(type=8 if e["dir"] == "out" else 0)
             p = eth / ip / l4
-            pad = e["size"] - len(p)
-            if pad > 0:
-                p = p / Raw(b"\x00" * pad)
+            if pad_to_size:
+                pad = e["size"] - len(p)
+                if pad > 0:
+                    p = p / Raw(b"\x00" * pad)
             p.time = e["ts"]
             pkts.append(p)
 

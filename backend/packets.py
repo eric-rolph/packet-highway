@@ -150,6 +150,25 @@ def summarize_packet(pkt: Packet, pid: int, ref_ips: set[str]) -> dict | None:
         if transport == "OTHER" and proto_num in (50, 51):
             proto = "VPN"  # IPsec ESP/AH
 
+        # DNS transaction header — lets the frontend match queries to
+        # responses and surface NXDOMAIN / SERVFAIL / timeouts
+        dns_id = dns_qr = dns_rcode = None
+        dns_qname = None
+        if proto == "DNS" and l4 is not None:
+            try:
+                dns = l4.payload
+                if dns is not None and dns.__class__.__name__ == "DNS":
+                    dns_id = int(dns.id)
+                    dns_qr = int(dns.qr)
+                    dns_rcode = int(dns.rcode)
+                    if dns.qd:
+                        qname = dns.qd[0].qname
+                        if isinstance(qname, bytes):
+                            qname = qname.decode("utf-8", "replace")
+                        dns_qname = qname.rstrip(".")[:120]
+            except Exception:
+                pass  # malformed DNS — keep the packet, drop the extras
+
         return {
             "id": pid,
             "ts": ts,
@@ -166,6 +185,10 @@ def summarize_packet(pkt: Packet, pid: int, ref_ips: set[str]) -> dict | None:
             "ttl": ttl,
             "icmp_type": icmp_type,
             "icmp_code": icmp_code,
+            "dns_id": dns_id,
+            "dns_qr": dns_qr,
+            "dns_rcode": dns_rcode,
+            "dns_qname": dns_qname,
             "dir": infer_dir(src, dst, ref_ips),
         }
     except Exception:

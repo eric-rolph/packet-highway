@@ -140,6 +140,17 @@
         </section>
 
         <section>
+          <h2 class="text-[10px] font-bold tracking-[0.2em] text-slate-400 mb-2">DNS HEALTH <span class="text-slate-600">lookups</span></h2>
+          <div class="grid grid-cols-2 gap-x-3 gap-y-1 text-xs num">
+            <div class="flex justify-between"><span class="text-slate-400">✓ resolved</span><b id="dnsh-ok" class="text-emerald-400">0</b></div>
+            <div class="flex justify-between"><span class="text-slate-400" title="median query→response latency">lookup med</span><b id="dnsh-rtt" class="text-cyan-300">—</b></div>
+            <div class="flex justify-between"><span class="text-slate-400">⛔ NXDOMAIN</span><b id="dnsh-nx" class="text-red-400">0</b></div>
+            <div class="flex justify-between"><span class="text-slate-400">⛔ SERVFAIL</span><b id="dnsh-sf" class="text-rose-400">0</b></div>
+            <div class="flex justify-between col-span-2"><span class="text-slate-400">⚠ timeouts</span><b id="dnsh-to" class="text-amber-400">0</b></div>
+          </div>
+        </section>
+
+        <section>
           <h2 class="text-[10px] font-bold tracking-[0.2em] text-slate-400 mb-2">TOP TALKERS <span class="text-slate-600">by bytes</span></h2>
           <div id="talkers-list" class="flex flex-col gap-1.5 text-xs num"></div>
         </section>

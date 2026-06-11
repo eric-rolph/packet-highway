@@ -15,7 +15,7 @@
 //     packet→flow shift sFlow/NetFlow make at scale.
 // Every packet always counts in the dashboard stats; only visuals aggregate.
 import {
-  FLAG_COLORS, HALF_LEN, HIGHWAY, LANES, LANE_SPEED, PROTO_COLORS,
+  FAIL_RED, FLAG_COLORS, HALF_LEN, HIGHWAY, LANES, LANE_SPEED, PROTO_COLORS,
   TYPE_SPECS, flowKeyOf, laneFor, sublaneX, vehicleTypeFor,
 } from './config.js';
 import { FlarePool, VehiclePool } from './vehicles.js';
@@ -184,8 +184,10 @@ export class TrafficController {
       const v6 = !!pkt.src && pkt.src.includes(':');
       const err = pkt.icmp_type != null
         && (v6 ? ICMP_ERR_V6 : ICMP_ERR_V4).has(pkt.icmp_type);
-      color = err ? 0xf87171 : PROTO_COLORS.ICMP;     // error reports ride red
+      color = err ? FAIL_RED : PROTO_COLORS.ICMP;     // error reports ride red
       beaconColor = 0xffffff;                         // tinted red/blue per frame
+    } else if (pkt.dns_qr === 1 && (pkt.dns_rcode === 2 || pkt.dns_rcode === 3)) {
+      color = FAIL_RED;                               // failed-lookup motorcycle
     }
     let scaleL = 1;
     if (type === 'van') scaleL = Math.min(1 + pkt.size / 1200, 1.8);
@@ -220,6 +222,26 @@ export class TrafficController {
       z: dirSign * HALF_LEN * (0.12 + 0.76 * hash01(key)), // stable per target
       color: event.kind === 'refused' ? 0xef4444 : 0xfbbf24,
       meta: { flowEvent: event.kind, syn, rst: event.rst ?? null },
+      key,
+    });
+  }
+
+  /** Roadside flare for a DNS failure; stacks per name (NXDOMAIN) or server. */
+  spawnDnsFlare(event) {
+    const ref = event.query ?? event.resp;
+    if (!ref) return;
+    const key = event.kind === 'nxdomain'
+      ? `dns:${event.resp?.dns_qname ?? ref.dns_qname ?? '?'}`
+      : `dns:${event.kind === 'dnstimeout' ? ref.dst : ref.src}`; // server
+    const dirSign = ref.dir === 'in' ? 1 : -1;
+    const side = ref.dir === 'in' ? 1 : -1;
+    const color = event.kind === 'nxdomain' ? 0xef4444
+      : event.kind === 'servfail' ? 0xf43f5e : 0xfbbf24;
+    this.flares.spawn({
+      x: side * this.shoulderX,
+      z: dirSign * HALF_LEN * (0.12 + 0.76 * hash01(key)),
+      color,
+      meta: { flowEvent: event.kind, dns: true, query: event.query, resp: event.resp, syn: ref },
       key,
     });
   }

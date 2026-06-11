@@ -4,6 +4,7 @@
 // Aggregates into per-second buckets at add() time, so snapshot cost depends
 // on the window length (≤60 buckets), not the packet rate — at thousands of
 // packets/sec the old per-event array melted the frame budget.
+import { isBroadcast } from './config.js';
 
 export class StatsEngine {
   constructor(windowSec = 60) {
@@ -21,11 +22,12 @@ export class StatsEngine {
     const sec = Math.floor(p.ts);
     let b = this.buckets.get(sec);
     if (!b) {
-      b = { pkts: 0, bytes: 0, bytesIn: 0, bytesOut: 0, protos: new Map(), talkers: new Map() };
+      b = { pkts: 0, bytes: 0, bytesIn: 0, bytesOut: 0, bcast: 0, protos: new Map(), talkers: new Map() };
       this.buckets.set(sec, b);
     }
     b.pkts++;
     b.bytes += p.size;
+    if (isBroadcast(p)) b.bcast++;
     if (p.dir === 'in') b.bytesIn += p.size; else b.bytesOut += p.size;
     const pr = b.protos.get(p.proto) ?? { pkts: 0, bytes: 0 };
     pr.pkts++; pr.bytes += p.size;
@@ -50,7 +52,7 @@ export class StatsEngine {
   snapshot(now) {
     this.prune(now);
     const nowSec = Math.floor(now);
-    let bwIn = 0, bwOut = 0, pps = 0, winPkts = 0;
+    let bwIn = 0, bwOut = 0, pps = 0, winPkts = 0, bcastPps = 0, bcastWin = 0;
     const protos = new Map();
     const talkers = new Map();
     const series = new Float64Array(this.windowSec); // bytes/sec, oldest first
@@ -60,8 +62,9 @@ export class StatsEngine {
       if (age < 0 || age >= this.windowSec) continue;
       series[this.windowSec - 1 - age] += b.bytes;
       winPkts += b.pkts;
+      bcastWin += b.bcast;
       if (age <= 1) { bwIn += b.bytesIn; bwOut += b.bytesOut; }
-      if (age === 1) pps = b.pkts; // last COMPLETED second
+      if (age === 1) { pps = b.pkts; bcastPps = b.bcast; } // last COMPLETED second
       for (const [proto, v] of b.protos) {
         const agg = protos.get(proto) ?? { pkts: 0, bytes: 0 };
         agg.pkts += v.pkts; agg.bytes += v.bytes;
@@ -80,6 +83,8 @@ export class StatsEngine {
       bpsIn: (bwIn / 2) * 8,
       bpsOut: (bwOut / 2) * 8,
       pps,
+      bcastPps,
+      bcastWin,
       totalPkts: this.totalPkts,
       totalBytes: this.totalBytes,
       protoDist: [...protos.entries()]

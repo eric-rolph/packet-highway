@@ -1,4 +1,13 @@
 // Canvas renderers for the playback histogram and the bandwidth sparkline.
+//
+// The scrubber histogram is stacked by LANE (same colors as the road) and
+// carries failure tick marks — red for RSTs, amber for DNS failures — so
+// "scrub to the anomaly" works at a glance.
+import { LANES, LANE_REPR, laneFor } from './config.js';
+
+const LANE_KEYS = LANES.map((l) => l.key);
+const LANE_IDX = Object.fromEntries(LANE_KEYS.map((k, i) => [k, i]));
+const LANE_CSS = LANE_KEYS.map((k) => '#' + LANE_REPR[k].toString(16).padStart(6, '0'));
 
 function prepCanvas(canvas) {
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
@@ -12,36 +21,54 @@ function prepCanvas(canvas) {
   return { g, w, h };
 }
 
-/** Bucket packet counts across the capture for the scrubber background. */
+/** Lane-stacked packet counts + failure markers across the capture. */
 export function computeBuckets(packets, meta, n = 240) {
-  const buckets = new Float64Array(n);
+  const L = LANE_KEYS.length;
+  const stacks = new Float32Array(n * L);
+  const totals = new Float32Array(n);
+  const tickRst = new Uint8Array(n);   // bucket contains RSTs
+  const tickDns = new Uint8Array(n);   // bucket contains DNS failures
   const span = meta.duration || 1;
   for (const p of packets) {
     let b = Math.floor(((p.ts - meta.start) / span) * n);
     if (b >= n) b = n - 1;
     if (b < 0) b = 0;
-    buckets[b]++;
+    stacks[b * L + (LANE_IDX[laneFor(p)] ?? L - 1)]++;
+    totals[b]++;
+    if (p.flags && p.flags.includes('R')) tickRst[b] = 1;
+    if (p.dns_qr === 1 && (p.dns_rcode === 2 || p.dns_rcode === 3)) tickDns[b] = 1;
   }
-  return buckets;
+  let max = 1;
+  for (const v of totals) if (v > max) max = v;
+  return { stacks, totals, tickRst, tickDns, n, L, max };
 }
 
-export function drawHistogram(canvas, buckets, playheadFrac) {
+export function drawHistogram(canvas, H, playheadFrac) {
   const { g, w, h } = prepCanvas(canvas);
   g.clearRect(0, 0, w, h);
-  if (!buckets) return;
-  let max = 1;
-  for (const v of buckets) if (v > max) max = v;
-  const bw = w / buckets.length;
-  for (let i = 0; i < buckets.length; i++) {
-    const frac = buckets[i] / max;
-    const bh = Math.max(frac * (h - 6), buckets[i] > 0 ? 1.5 : 0);
-    const played = i / buckets.length <= playheadFrac;
-    g.fillStyle = played ? `rgba(34, 211, 238, ${0.35 + frac * 0.6})`
-                         : `rgba(100, 116, 139, ${0.25 + frac * 0.45})`;
-    g.fillRect(i * bw + 0.5, h - bh, Math.max(bw - 1, 1), bh);
+  if (!H) return;
+  const { stacks, tickRst, tickDns, n, L, max } = H;
+  const bw = w / n;
+  const usable = h - 8; // leave headroom for tick marks
+  for (let i = 0; i < n; i++) {
+    let y = h;
+    for (let l = 0; l < L; l++) {
+      const v = stacks[i * L + l];
+      if (!v) continue;
+      const seg = (v / max) * usable;
+      g.fillStyle = LANE_CSS[l];
+      g.globalAlpha = 0.8;
+      g.fillRect(i * bw + 0.5, y - seg, Math.max(bw - 1, 1), seg);
+      y -= seg;
+    }
+    g.globalAlpha = 1;
+    if (tickRst[i]) { g.fillStyle = '#ef4444'; g.fillRect(i * bw + 0.5, 0, Math.max(bw - 1, 1.5), 3); }
+    if (tickDns[i]) { g.fillStyle = '#fbbf24'; g.fillRect(i * bw + 0.5, 4, Math.max(bw - 1, 1.5), 3); }
   }
-  // playhead
+  // dim the un-played region instead of redrawing two color states
   const x = playheadFrac * w;
+  g.fillStyle = 'rgba(5, 8, 15, 0.55)';
+  g.fillRect(x, 0, w - x, h);
   g.fillStyle = 'rgba(248, 250, 252, 0.9)';
   g.fillRect(x - 0.75, 0, 1.5, h);
 }
