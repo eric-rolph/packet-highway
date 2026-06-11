@@ -10,8 +10,7 @@ of service (web, DNS, management, infrastructure, file transfer…). Watch your
 network live, or replay a `.pcap` with full scrub/seek control.
 
 Built with **FastAPI + Scapy** on the backend and **Three.js** (zero-build,
-vanilla ES modules) on the frontend.
-**Demo video:** <https://youtu.be/oALYgxMnnMw> (thumbnail above).
+vanilla ES modules) on the frontend. Demo video above.
 
 ---
 
