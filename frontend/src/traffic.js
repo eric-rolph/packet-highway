@@ -14,11 +14,12 @@
 //     one road-train = N packets (click it for the breakdown), the same
 //     packet→flow shift sFlow/NetFlow make at scale.
 // Every packet always counts in the dashboard stats; only visuals aggregate.
+import * as THREE from 'three';
 import {
-  FAIL_RED, FLAG_COLORS, HALF_LEN, HIGHWAY, LANES, LANE_SPEED, PROTO_COLORS,
-  TYPE_SPECS, flowKeyOf, laneFor, sublaneX, vehicleTypeFor,
+  FAIL_RED, FLAG_COLORS, HALF_LEN, HIGHWAY, LANES, LANE_REPR, LANE_SPEED,
+  PROTO_COLORS, TYPE_SPECS, flowKeyOf, laneFor, sublaneX, vehicleTypeFor,
 } from './config.js';
-import { FlarePool, VehiclePool } from './vehicles.js';
+import { FlarePool, LabelPool, VehiclePool } from './vehicles.js';
 
 const MAX_CONVOY_SAMPLES = 8;
 const GAP_BUFFER = 2.4; // bumper-to-bumper clearance at spawn, world units
@@ -55,8 +56,31 @@ export class TrafficController {
     this.pendingAgg = new Map();// `${lane}|${dir}` -> accumulating burst
     this.spawned = 0;
     this.aggregatedPkts = 0;    // packets that rode inside a convoy
-    this.highlightKey = null;   // flow highlight (click a vehicle)
+    this.highlight = null;      // {type:'flow'|'host', key} — click to spotlight
     this.shoulderX = HIGHWAY.medianWidth / 2 + LANES.length * HIGHWAY.laneWidth + HIGHWAY.shoulder * 0.55;
+
+    // floating ×N labels over convoys
+    this.labels = new LabelPool(scene);
+    this.labeled = new Map();   // labelIdx -> convoy rec
+
+    // per-lane utilization glow: bursts read as literal lane heat
+    this.laneLoad = new Map();  // `${lane}|${dir}` -> decaying packet count
+    this.glow = [];
+    for (const lane of LANES) {
+      for (const dirKey of ['in', 'out']) {
+        const mat = new THREE.MeshBasicMaterial({
+          color: LANE_REPR[lane.key], transparent: true, opacity: 0,
+          depthWrite: false, blending: THREE.AdditiveBlending,
+        });
+        const strip = new THREE.Mesh(
+          new THREE.PlaneGeometry(HIGHWAY.laneWidth - 1.4, HIGHWAY.length), mat);
+        strip.rotation.x = -Math.PI / 2;
+        strip.position.set(laneX[lane.key][dirKey], 0.045, 0);
+        strip.raycast = () => {};
+        scene.add(strip);
+        this.glow.push({ key: `${lane.key}|${dirKey}`, mat });
+      }
+    }
   }
 
   get meshes() { return [...Object.values(this.pools).map((p) => p.mesh), this.flares.mesh]; }
@@ -84,6 +108,7 @@ export class TrafficController {
   schedule(pkt) {
     const lane = laneFor(pkt);
     const key = `${lane}|${pkt.dir}`;
+    this.laneLoad.set(key, (this.laneLoad.get(key) ?? 0) + 1);
     const agg = this.pendingAgg.get(key);
     if (agg) {
       this.addToAgg(agg, pkt); // a burst is in progress — join it
@@ -129,7 +154,7 @@ export class TrafficController {
     return -1;
   }
 
-  /** Common placement path. Returns false when the lane entry is full. */
+  /** Common placement path. Returns the spawned rec, or null when full. */
   place(type, lane, dirKey, { color, beaconColor, scaleL = 1, meta }) {
     const spec = TYPE_SPECS[type];
     const len = spec.len * scaleL;
@@ -147,11 +172,11 @@ export class TrafficController {
         len: spec.len, yBase: 3.0 + Math.random() * 2.4,
       });
       this.afterSpawn(this.pools.drone, rec, lane, dirKey, -1);
-      return true;
+      return rec;
     }
 
     const sub = this.pickSub(laneKey, len);
-    if (sub === -1) return false;
+    if (sub === -1) return null;
     const rec = this.pools[type].spawn({
       x: sublaneX(center, dirKey, sub) + (Math.random() - 0.5) * 0.7,
       dirSign, speed, color, scaleL, meta, len: spec.len, yBase: 0,
@@ -160,7 +185,7 @@ export class TrafficController {
     this.tails.set(`${laneKey}|${sub}`, rec);
     this.lastSub.set(laneKey, sub);
     this.afterSpawn(this.pools[type], rec, lane, dirKey, sub);
-    return true;
+    return rec;
   }
 
   afterSpawn(pool, rec, lane, dirKey, sub) {
@@ -176,10 +201,13 @@ export class TrafficController {
     let color = PROTO_COLORS[pkt.proto] ?? PROTO_COLORS.OTHER;
     let beaconColor;
     if (type === 'signal') {
-      color = PROTO_COLORS.TCP;                       // body stays "TCP gray"
-      const strobe = pkt.flags.includes('R') ? 'R' : pkt.flags.includes('F') ? 'F'
+      // whole body takes the flag color — readable at any distance:
+      // amber = opening (SYN), green = accepted (SYN-ACK),
+      // purple = closing (FIN), red = reset (RST)
+      const flag = pkt.flags.includes('R') ? 'R' : pkt.flags.includes('F') ? 'F'
         : pkt.flags.includes('A') ? 'SA' : 'S';
-      beaconColor = FLAG_COLORS[strobe];
+      color = FLAG_COLORS[flag];
+      beaconColor = 0xffffff;
     } else if (type === 'police') {
       const v6 = !!pkt.src && pkt.src.includes(':');
       const err = pkt.icmp_type != null
@@ -189,6 +217,7 @@ export class TrafficController {
     } else if (pkt.dns_qr === 1 && (pkt.dns_rcode === 2 || pkt.dns_rcode === 3)) {
       color = FAIL_RED;                               // failed-lookup motorcycle
     }
+    if (pkt.retrans) color = FAIL_RED;                // the same truck, twice
     let scaleL = 1;
     if (type === 'van') scaleL = Math.min(1 + pkt.size / 1200, 1.8);
     else if (type === 'truck') scaleL = Math.min(0.9 + pkt.size / 2200, 2.2);
@@ -204,11 +233,17 @@ export class TrafficController {
     // log scale: engineers think in orders of magnitude, and a linear cap
     // would make a 30-packet burst look like a 3000-packet flood
     const scaleL = Math.min(0.8 + Math.log10(1 + agg.count) * 0.85, 3.2);
-    const ok = this.place('convoy', agg.lane, agg.dir, {
+    const rec = this.place('convoy', agg.lane, agg.dir, {
       color: PROTO_COLORS[dominant] ?? PROTO_COLORS.OTHER, scaleL, meta: agg,
     });
-    if (ok) this.aggregatedPkts += agg.count;
-    return ok;
+    if (rec) {
+      this.aggregatedPkts += agg.count;
+      if (agg.count >= 5) {
+        const li = this.labels.acquire('×' + agg.count);
+        if (li >= 0) this.labeled.set(li, rec);
+      }
+    }
+    return !!rec;
   }
 
   /** Roadside flare for a failed handshake; stacks per target service. */
@@ -246,19 +281,30 @@ export class TrafficController {
     });
   }
 
-  /** Click-to-follow-flow: matching vehicles keep their color, rest dim. */
-  setHighlight(key) {
-    if (key === this.highlightKey) return;
-    this.highlightKey = key;
+  /** Click-to-spotlight: sel = {type:'flow'|'host', key} or null.
+   *  Matching vehicles keep their color, the rest of the road dims. */
+  setHighlight(sel) {
+    if (sel?.key === this.highlight?.key && sel?.type === this.highlight?.type) return;
+    this.highlight = sel ?? null;
     for (const pool of Object.values(this.pools)) {
       for (const rec of pool.active.values()) pool.tint(rec.idx, this.displayColor(rec));
     }
   }
 
   displayColor(rec) {
-    if (!this.highlightKey) return rec.baseColor;
+    if (!this.highlight) return rec.baseColor;
     const m = rec.meta;
-    const match = m && !m.aggregate && flowKeyOf(m) === this.highlightKey;
+    const { type, key } = this.highlight;
+    let match = false;
+    if (m) {
+      if (m.aggregate) {
+        match = type === 'host' && (m.samples?.some((s) => s.src === key || s.dst === key) ?? false);
+      } else if (type === 'flow') {
+        match = flowKeyOf(m) === key;
+      } else {
+        match = m.src === key || m.dst === key;
+      }
+    }
     return match ? rec.baseColor : dimColor(rec.baseColor);
   }
 
@@ -273,6 +319,24 @@ export class TrafficController {
     this.flushAggs();
     for (const pool of Object.values(this.pools)) pool.update(dt, t);
     this.flares.update(dt, t);
+
+    // convoy count labels track their vehicles
+    for (const [li, rec] of this.labeled) {
+      if (rec.gone) {
+        this.labels.release(li);
+        this.labeled.delete(li);
+      } else {
+        this.labels.position(li, rec.x, 7.2, rec.z);
+      }
+    }
+
+    // lane glow follows a decaying per-lane packet rate
+    const decay = Math.exp(-dt / 1.5);
+    for (const g of this.glow) {
+      const v = (this.laneLoad.get(g.key) ?? 0) * decay;
+      this.laneLoad.set(g.key, v);
+      g.mat.opacity = Math.min(v / 60, 1) * 0.35;
+    }
   }
 
   clear() {
@@ -280,7 +344,11 @@ export class TrafficController {
     this.tails.clear();
     this.lastSub.clear();
     this.pendingAgg.clear();
-    this.highlightKey = null;
+    this.highlight = null;
+    for (const li of this.labeled.keys()) this.labels.release(li);
+    this.labeled.clear();
+    this.laneLoad.clear();
+    for (const g of this.glow) g.mat.opacity = 0;
     for (const pool of Object.values(this.pools)) pool.clear();
     this.flares.clear();
   }

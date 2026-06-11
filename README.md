@@ -69,15 +69,35 @@ scrubber histogram is **stacked by lane** (same colors as the road) with
 red/amber **tick marks at RSTs and DNS failures** — scrub straight to the
 anomaly.
 
+### Is something wrong? (glanceability)
+
+A **NETWORK STATUS pill** sits above the dashboard: green / amber / red with
+the reason ("TCP connections failing", "DNS failures", "packet loss",
+"broadcast storm", "view incomplete"), judged over the **last 60 seconds** so
+old incidents age out. Failures are physical on the road too: failed
+connections and lookups become **breakdowns** — tilted cars with blinking
+hazards on the shoulder (amber = no answer, red = refused/bad name), growing
+when the same target keeps failing. Convoys carry floating **×N labels**, and
+each lane has a **utilization glow** that brightens with load, so bursts read
+as literal lane heat. Every health number is **clickable** — half-open,
+refused, RST, retransmissions, NXDOMAIN, SERVFAIL, timeouts each open a
+recent-evidence list (which targets, how many times). Clicking a **Top
+Talker** spotlights everything touching that host.
+
 ### TCP telemetry
 
 Beyond the failure counters, the flow tracker passively measures **handshake
-RTT** (SYN→SYN-ACK, median/p95 in the TCP HEALTH panel) and counts **SYN
-retries**, with kernel retransmit schedules de-duplicated so one dead connect()
-isn't counted as several failures. Shoulder flares **stack per target** —
-a dead service grows one tall flare, a port scan paints a strip of them.
-Clicking any vehicle (or flare) **spotlights its whole conversation**: every
-vehicle in that 4-tuple keeps its color while the rest of the road dims.
+RTT** (SYN→SYN-ACK, median/p95 in the TCP HEALTH panel), counts **SYN
+retries** (kernel retransmit schedules de-duplicated so one dead connect()
+isn't counted as several failures), and detects **retransmissions** by
+tracking sequence numbers — a data segment ending at-or-before the highest
+seen end is the same truck making the trip twice, tinted red. TCP control
+packets ride as whole-body **flag-colored cars**: amber = opening (SYN),
+green = accepted (SYN-ACK), purple = closing (FIN), red = reset (RST).
+**TLS SNI** is extracted from ClientHellos, so clicking an HTTPS vehicle
+shows *which* server name the connection is for. Clicking any vehicle (or
+breakdown) **spotlights its whole conversation**: every vehicle in that
+4-tuple keeps its color while the rest of the road dims.
 
 ### TCP handshake troubleshooting
 

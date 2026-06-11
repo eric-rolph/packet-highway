@@ -33,12 +33,32 @@ export class DnsTracker {
   reset() {
     this.pending.clear();
     this.rtts.length = 0;
+    this.log = [];
     this.counts = { queries: 0, ok: 0, nxdomain: 0, servfail: 0, timeouts: 0 };
+  }
+
+  pushLog(kind, target, extra = '') {
+    this.log.push({ kind, target, extra, ts: this._lastTs ?? 0 });
+    if (this.log.length > 80) this.log.shift();
+  }
+
+  /** Recent failure evidence for a category, grouped by name/resolver. */
+  recent(kind) {
+    const grouped = new Map();
+    for (const e of this.log) {
+      if (e.kind !== kind) continue;
+      const g = grouped.get(e.target) ?? { target: e.target, extra: e.extra, count: 0, last: 0 };
+      g.count++;
+      if (e.ts > g.last) { g.last = e.ts; g.extra = e.extra || g.extra; }
+      grouped.set(e.target, g);
+    }
+    return [...grouped.values()].sort((a, b) => b.last - a.last);
   }
 
   /** Feed every packet. Returns a failure event to visualize, or null. */
   add(p) {
     if (p.proto !== 'DNS' || p.dns_qr == null) return null;
+    this._lastTs = p.ts;
     if (p.dns_qr === 0) {
       this.counts.queries++;
       if (isMulticastDst(p)) return null; // discovery chatter — no answer expected
@@ -61,10 +81,12 @@ export class DnsTracker {
     }
     if (p.dns_rcode === 3) {
       this.counts.nxdomain++;
+      this.pushLog('nxdomain', p.dns_qname ?? '(unknown name)', `resolver ${p.src}`);
       return { kind: 'nxdomain', query: pend?.pkt ?? null, resp: p };
     }
     if (p.dns_rcode === 2) {
       this.counts.servfail++;
+      this.pushLog('servfail', p.dns_qname ?? '(unknown name)', `resolver ${p.src}`);
       return { kind: 'servfail', query: pend?.pkt ?? null, resp: p };
     }
     this.counts.ok++;
@@ -78,6 +100,7 @@ export class DnsTracker {
       if (now - v.t > this.timeoutSec) {
         this.pending.delete(k);
         this.counts.timeouts++;
+        this.pushLog('dnstimeout', v.pkt.dst, v.pkt.dns_qname ? `name ${v.pkt.dns_qname}` : '');
         out.push({ kind: 'dnstimeout', query: v.pkt, resp: null });
       }
     }

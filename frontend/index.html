@@ -100,6 +100,7 @@
 
       <!-- Stats panel -->
       <aside class="pointer-events-auto panel w-72 p-4 flex flex-col gap-4 overflow-y-auto self-start max-h-full">
+        <button id="status-pill" class="w-full mb-1 px-3 py-2 rounded-lg text-xs font-bold tracking-wide text-left border bg-emerald-500/15 text-emerald-300 border-emerald-500/30 cursor-pointer">● NETWORK OK</button>
         <section>
           <h2 class="text-[10px] font-bold tracking-[0.2em] text-slate-400 mb-2">BANDWIDTH</h2>
           <div class="grid grid-cols-2 gap-2">
@@ -132,7 +133,8 @@
             <div class="flex justify-between"><span class="text-slate-400">⛔ refused</span><b id="tcph-refused" class="text-red-400">0</b></div>
             <div class="flex justify-between"><span class="text-slate-400">RST seen</span><b id="tcph-rst" class="text-red-300">0</b></div>
             <div class="flex justify-between"><span class="text-slate-400">SYN retries</span><b id="tcph-retries" class="text-amber-300">0</b></div>
-            <div class="flex justify-between col-span-2"><span class="text-slate-400" title="passive handshake RTT (SYN→SYN-ACK), median / 95th percentile">RTT med · p95</span><b id="tcph-rtt" class="text-cyan-300">—</b></div>
+            <div class="flex justify-between"><span class="text-slate-400" title="data segments sent twice = packet loss">🔁 retrans</span><b id="tcph-retrans" class="text-red-300">0</b></div>
+            <div class="flex justify-between"><span class="text-slate-400" title="passive handshake RTT (SYN→SYN-ACK), median / 95th percentile">RTT med·p95</span><b id="tcph-rtt" class="text-cyan-300">—</b></div>
           </div>
           <div class="h-1.5 bg-slate-800 rounded-full overflow-hidden mt-2" title="handshake success ratio">
             <div id="tcph-bar" class="h-full rounded-full bg-emerald-500" style="width:100%"></div>

@@ -46,7 +46,8 @@ BAD_NAMES = ["githib.com", "exmaple.cmo", "old-service.internal", "dead.startup.
 _MAC_BY_IP = {HOME_IP: HOME_MAC, "192.168.1.20": NAS_MAC, "192.168.1.1": GW_MAC}
 
 
-def _make_event(ts, src, dst, sport, dport, transport, size, flags, rng, ttl_map, dns=None):
+def _make_event(ts, src, dst, sport, dport, transport, size, flags, rng, ttl_map,
+                dns=None, seq=None, sni=None):
     out = src == HOME_IP
     # one TTL per host per generation run — a flow's TTL never jitters
     if src not in ttl_map:
@@ -72,6 +73,9 @@ def _make_event(ts, src, dst, sport, dport, transport, size, flags, rng, ttl_map
         "dns_qr": dns["qr"] if dns else None,
         "dns_rcode": dns.get("rcode", 0) if dns else None,
         "dns_qname": dns.get("qname") if dns else None,
+        "seq": seq,
+        "plen": max(size - 66, 0) if (transport == "TCP" and seq is not None) else None,
+        "sni": sni,
         "dir": "out" if out else "in",
     }
 
@@ -81,8 +85,9 @@ def gen_events(t0: float, duration: float, rng: random.Random) -> list[dict]:
     ev: list[dict] = []
     ttl_map: dict[str, int] = {}
 
-    def _ev(ts, src, dst, sport, dport, transport, size, flags="", dns=None):
-        return _make_event(ts, src, dst, sport, dport, transport, size, flags, rng, ttl_map, dns)
+    def _ev(ts, src, dst, sport, dport, transport, size, flags="", dns=None, seq=None, sni=None):
+        return _make_event(ts, src, dst, sport, dport, transport, size, flags, rng, ttl_map,
+                           dns, seq, sni)
 
     def dns_pair(t, qname=None, rcode=0, answered=True):
         """A DNS lookup: query out, (optionally) response back."""
@@ -101,22 +106,33 @@ def gen_events(t0: float, duration: float, rng: random.Random) -> list[dict]:
         srv = rng.choice(WEB_HOSTS)
         cport = rng.randint(49152, 65000)
         port = 443 if rng.random() < 0.85 else 80
-        dns_pair(t)  # lookup precedes the connection
+        qname = rng.choice(OK_NAMES)
+        dns_pair(t, qname=qname)  # lookup precedes the connection
         # TCP handshake
         t2 = t + rng.uniform(0.06, 0.16)
         rtt = rng.uniform(0.012, 0.06)
         ev.append(_ev(t2, HOME_IP, srv, cport, port, "TCP", 66, "S"))
         ev.append(_ev(t2 + rtt, srv, HOME_IP, port, cport, "TCP", 66, "SA"))
         ev.append(_ev(t2 + rtt * 1.5, HOME_IP, srv, cport, port, "TCP", 60, "A"))
-        # Request out, response burst in
+        # Request out (carries the SNI for HTTPS), response burst in
         t3 = t2 + rtt * 2
-        ev.append(_ev(t3, HOME_IP, srv, cport, port, "TCP", rng.randint(250, 1100), "PA"))
+        ev.append(_ev(t3, HOME_IP, srv, cport, port, "TCP", rng.randint(250, 1100), "PA",
+                      sni=qname if port == 443 else None))
         tr = t3 + rtt
+        srv_seq = rng.randint(1_000_000, 900_000_000)
+        prev = None
         for _ in range(rng.randint(2, 9)):
             tr += rng.uniform(0.008, 0.05)
-            ev.append(_ev(tr, srv, HOME_IP, port, cport, "TCP", rng.randint(620, 1514), "PA"))
+            size = rng.randint(620, 1514)
+            ev.append(_ev(tr, srv, HOME_IP, port, cport, "TCP", size, "PA", seq=srv_seq))
+            prev = (srv_seq, size)
+            srv_seq += size - 66
             if rng.random() < 0.5:
                 ev.append(_ev(tr + 0.004, HOME_IP, srv, cport, port, "TCP", 60, "A"))
+        # ~7% of sessions lose a segment: the server sends it again
+        if prev and rng.random() < 0.07:
+            ev.append(_ev(tr + rng.uniform(0.15, 0.4), srv, HOME_IP, port, cport,
+                          "TCP", prev[1], "PA", seq=prev[0]))
         # Teardown: 60% clean FIN exchange, 30% RST, 10% left open
         r = rng.random()
         if r < 0.6:
@@ -302,12 +318,19 @@ def build_sample_pcap_bytes(duration: float = 90.0, seed: int = 7) -> bytes:
         t0 = time.time() - duration
         events = gen_events(t0, duration, rng)
         pkts = []
+        flow_seq: dict[tuple, int] = {}  # realistic advancing seq per flow
         for e in events:
             eth = Ether(src=e["smac"], dst=e["dmac"])
             ip = IP(src=e["src"], dst=e["dst"], ttl=e["ttl"])
             pad_to_size = True
             if e["transport"] == "TCP":
-                l4 = TCP(sport=e["sport"], dport=e["dport"], flags=e["flags"] or "PA")
+                if e.get("seq") is not None:
+                    seq = e["seq"]
+                else:
+                    fkey = (e["src"], e["sport"], e["dst"], e["dport"])
+                    seq = flow_seq.get(fkey, rng.randint(1_000, 2_000_000_000))
+                    flow_seq[fkey] = (seq + max(e["size"] - 66, 1)) & 0xFFFFFFFF
+                l4 = TCP(sport=e["sport"], dport=e["dport"], flags=e["flags"] or "PA", seq=seq)
             elif e["transport"] == "UDP":
                 l4 = UDP(sport=e["sport"], dport=e["dport"])
                 if e.get("dns_id") is not None:
@@ -324,7 +347,11 @@ def build_sample_pcap_bytes(duration: float = 90.0, seed: int = 7) -> bytes:
             p = eth / ip / l4
             if pad_to_size:
                 pad = e["size"] - len(p)
-                if pad > 0:
+                # don't fake TCP payload out of L2 padding: tiny pads on
+                # control frames would read back as data and trip the
+                # retransmission detector
+                min_pad = 15 if e["transport"] == "TCP" else 1
+                if pad >= min_pad:
                     p = p / Raw(b"\x00" * pad)
             p.time = e["ts"]
             pkts.append(p)

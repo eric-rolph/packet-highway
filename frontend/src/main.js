@@ -27,18 +27,20 @@ const playback = new Playback();
 let mode = 'live';
 let liveDropped = 0;
 let lastStormWarn = -1e9;
-
-function ingestPacket(p) {
-  traffic.ingest(p);
-  trackPacket(p);
-}
+let currentReasons = [];
+const statusRing = []; // counter snapshots for windowed status verdicts
 
 function trackPacket(p) {
   stats.add(p);
-  const ev = flows.add(p);
+  const ev = flows.add(p); // also sets p.retrans before the vehicle spawns
   if (ev) traffic.spawnFlare(ev);
   const dnsEv = dns.add(p);
   if (dnsEv) traffic.spawnDnsFlare(dnsEv);
+}
+
+function ingestPacket(p) {
+  trackPacket(p);   // analysis first: spawn colors depend on it
+  traffic.ingest(p);
 }
 
 function resetWorld() {
@@ -47,6 +49,7 @@ function resetWorld() {
   flows.reset();
   dns.reset();
   liveDropped = 0;
+  statusRing.length = 0; // counters restarted — stale baselines would go negative
   picker.deselect();
 }
 
@@ -60,8 +63,8 @@ const live = new LiveSource({
   },
   onPackets: (items, dropped) => {
     if (mode !== 'live') return;
+    for (const p of items) trackPacket(p); // analysis first (retrans/SNI marks)
     traffic.ingestBatch(items, 110);
-    for (const p of items) trackPacket(p);
     liveDropped = dropped;
   },
   onError: (msg) => ui.toast(msg, 'error'),
@@ -115,13 +118,44 @@ const ui = new UI({
     seekTo((playback.t + sec - playback.meta.start) / playback.meta.duration);
   },
   onDetailClose() { picker.deselect(); },
+  onTalkerClick(ip) {
+    traffic.setHighlight({ type: 'host', key: ip });
+    ui.toast(`Spotlighting ${ip} — everything touching this host stays lit. Click empty road to clear.`, 'info');
+  },
+  onHealthClick(kind, title) {
+    const hints = {
+      halfopen: 'SYNs that were never answered — filtered ports, dead hosts, or scanners.',
+      refused: 'SYNs answered by RST — the port is closed or rejecting.',
+      rst: 'All resets seen, including mid-session aborts.',
+      retrans: 'Data segments sent twice — the signature of packet loss.',
+      nxdomain: 'Names that do not exist — typos, dead domains, broken search lists.',
+      servfail: 'The resolver failed these lookups — upstream or DNSSEC trouble.',
+      dnstimeout: 'Resolvers that never answered at all.',
+    };
+    const source = ['nxdomain', 'servfail', 'dnstimeout'].includes(kind) ? dns : flows;
+    ui.showHealthList(title, source.recent(kind), hints[kind]);
+  },
+  onStatusClick() {
+    const entries = currentReasons.length
+      ? currentReasons.map((r) => ({ target: r, count: 1, extra: '' }))
+      : [];
+    ui.showHealthList('Network status', entries,
+      currentReasons.length
+        ? 'Active issues — click the health rows on the left for per-target evidence.'
+        : 'No active issues. Verdict turns amber/red on TCP failures, DNS failures, packet loss, broadcast storms, or server-side drops.');
+  },
 });
 
 const picker = new Picker(canvas, camera, traffic, (meta) => {
+  // enrich with the flow's TLS server name when known
+  if (meta && !meta.aggregate && !meta.flowEvent && !meta.sni) {
+    meta._sni = flows.sniFor(flowKeyOf(meta));
+  }
   ui.showDetail(meta);
-  // spotlight the clicked packet's conversation (flares spotlight their SYN's)
+  // spotlight the clicked packet's conversation (breakdowns spotlight their SYN's)
   const flowPkt = meta?.flowEvent ? meta.syn : meta;
-  traffic.setHighlight(flowPkt && !flowPkt.aggregate ? flowKeyOf(flowPkt) : null);
+  const key = flowPkt && !flowPkt.aggregate ? flowKeyOf(flowPkt) : null;
+  traffic.setHighlight(key ? { type: 'flow', key } : null);
 });
 scene.add(picker.ring);
 
@@ -146,7 +180,7 @@ function loadTimeline(data) {
 }
 
 // Debug/automation handle (read-only access for testing)
-window.__ph = { scene, camera, traffic, playback, stats, flows, picker: () => picker };
+window.__ph = { scene, camera, traffic, playback, stats, flows, dns, picker: () => picker };
 
 ui.setMode('live');
 (function loadInterfaces(attempt = 0) {
@@ -201,6 +235,37 @@ function step(now, render) {
       lastStormWarn = statsNow;
       ui.toast(`Broadcast storm? ${snap.bcastPps}/s broadcast-multicast frames in the last second.`, 'error');
     }
+
+    // glanceable verdict — over the last ~60 s, not session-cumulative,
+    // so an old incident ages out and a new one isn't diluted by history
+    const c = flows.counts, dc = dns.counts;
+    statusRing.push({
+      t: statsNow, est: c.established, half: c.halfOpen, ref: c.refused,
+      retrans: c.retrans, fail: dc.nxdomain + dc.servfail + dc.timeouts,
+      ok: dc.ok, pkts: snap.totalPkts,
+    });
+    while (statusRing.length > 2 && statusRing[0].t < statsNow - 62) statusRing.shift();
+    const base = statusRing[0];
+    const w = {
+      est: c.established - base.est,
+      half: c.halfOpen - base.half,
+      ref: c.refused - base.ref,
+      retrans: c.retrans - base.retrans,
+      dnsFail: dc.nxdomain + dc.servfail + dc.timeouts - base.fail,
+      dnsOk: dc.ok - base.ok,
+      pkts: snap.totalPkts - base.pkts,
+    };
+    const reasons = [];
+    let level = 0; // 0 ok, 1 degraded, 2 problem
+    const attempts = w.est + w.half + w.ref;
+    if (attempts >= 8 && w.est / attempts < 0.8) { reasons.push('TCP connections failing'); level = 2; }
+    const lookups = w.dnsOk + w.dnsFail;
+    if (lookups >= 8 && w.dnsFail / lookups > 0.15) { reasons.push('DNS failures'); level = 2; }
+    if (w.pkts > 300 && w.retrans / w.pkts > 0.02) { reasons.push('packet loss (retransmissions)'); level = Math.max(level, 1); }
+    if (snap.bcastPps > 50) { reasons.push('broadcast storm'); level = 2; }
+    if (liveDropped > 0) { reasons.push('view incomplete (capture drops)'); level = Math.max(level, 1); }
+    currentReasons = reasons;
+    ui.setStatus(level === 2 ? 'problem' : level === 1 ? 'degraded' : 'ok', reasons);
     ui.hud({
       fps,
       active: traffic.activeCount(),

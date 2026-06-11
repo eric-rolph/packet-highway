@@ -50,8 +50,9 @@ export class UI {
       'talkers-list', 'legend-list', 'hud-fps', 'hud-active', 'hud-pps',
       'hud-merged', 'hud-recycled', 'hud-dropped',
       'tcph-est', 'tcph-pending', 'tcph-half', 'tcph-refused', 'tcph-rst',
-      'tcph-retries', 'tcph-rtt', 'tcph-bar',
+      'tcph-retries', 'tcph-retrans', 'tcph-rtt', 'tcph-bar',
       'dnsh-ok', 'dnsh-nx', 'dnsh-sf', 'dnsh-to', 'dnsh-rtt',
+      'status-pill',
       'detail-panel', 'detail-body', 'detail-close', 'playback-bar', 'btn-play',
       'sel-speed', 'time-cur', 'time-total', 'time-abs', 'scrub', 'hist-canvas',
       'toasts',
@@ -86,6 +87,64 @@ export class UI {
       else if (e.code === 'ArrowRight') this.cb.onSeekRelative(5);
       else if (e.code === 'ArrowLeft') this.cb.onSeekRelative(-5);
     });
+
+    // health rows drill down into recent evidence
+    const drill = {
+      'tcph-half': ['halfopen', 'Half-open connections'],
+      'tcph-refused': ['refused', 'Refused connections'],
+      'tcph-rst': ['rst', 'Recent resets'],
+      'tcph-retrans': ['retrans', 'Retransmissions'],
+      'dnsh-nx': ['nxdomain', 'NXDOMAIN names'],
+      'dnsh-sf': ['servfail', 'SERVFAIL lookups'],
+      'dnsh-to': ['dnstimeout', 'DNS timeouts'],
+    };
+    for (const [id, [kind, title]] of Object.entries(drill)) {
+      const row = this.el[id]?.parentElement;
+      if (!row) continue;
+      row.classList.add('cursor-pointer', 'hover:bg-slate-800/60', 'rounded', 'px-1', '-mx-1');
+      row.title = 'click for recent evidence';
+      row.addEventListener('click', () => this.cb.onHealthClick(kind, title));
+    }
+    this.el['status-pill'].addEventListener('click', () => this.cb.onStatusClick());
+
+    // Top Talkers: click an IP to spotlight everything touching it
+    this.el['talkers-list'].addEventListener('click', (e) => {
+      const ip = e.target.closest('[data-ip]')?.dataset.ip;
+      if (ip) this.cb.onTalkerClick(ip);
+    });
+  }
+
+  /** Glanceable verdict: 'ok' | 'degraded' | 'problem' + reason list. */
+  setStatus(verdict, reasons) {
+    const pill = this.el['status-pill'];
+    const base = 'w-full mb-1 px-3 py-2 rounded-lg text-xs font-bold tracking-wide text-left border transition-colors cursor-pointer ';
+    if (verdict === 'ok') {
+      pill.className = base + 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30';
+      pill.textContent = '● NETWORK OK';
+    } else if (verdict === 'degraded') {
+      pill.className = base + 'bg-amber-500/15 text-amber-300 border-amber-500/40';
+      pill.textContent = `⚠ DEGRADED — ${reasons[0] ?? ''}`;
+    } else {
+      pill.className = base + 'bg-red-500/20 text-red-300 border-red-500/50';
+      pill.textContent = `✖ PROBLEM — ${reasons.join(' · ')}`;
+    }
+    pill.title = reasons.length ? reasons.join('\n') + '\n(click for details)' : 'no active issues';
+  }
+
+  /** Drill-down list in the detail panel (health rows, status pill). */
+  showHealthList(title, entries, hint) {
+    const rows = entries.length
+      ? entries.slice(0, 14).map((e) => `
+        <div class="flex justify-between gap-3 py-1.5 border-b border-slate-800/80">
+          <span class="num font-mono text-slate-200 break-all">${esc(e.target)}</span>
+          <span class="text-slate-400 shrink-0 text-right">×${e.count}${e.extra ? `<div class="text-[10px] text-slate-500">${esc(e.extra)}</div>` : ''}</span>
+        </div>`).join('')
+      : '<div class="text-slate-500 py-2">nothing recorded in this session yet</div>';
+    this.el['detail-body'].innerHTML = `
+      <div class="badge bg-slate-200/10 text-slate-100 mb-2">${esc(title)}</div>
+      ${hint ? `<p class="text-slate-400 mb-2">${esc(hint)}</p>` : ''}
+      ${rows}`;
+    this.el['detail-panel'].classList.remove('hidden');
   }
 
   buildLegend() {
@@ -93,16 +152,16 @@ export class UI {
       <div><i class="inline-block w-2.5 h-2.5 rounded-sm mr-1.5 align-middle"
               style="background:${l.css ?? PROTO_CSS[l.proto]}"></i>${esc(l.text)}</div>`);
     rows.push(`
-      <div class="mt-1 text-slate-400">⚡ Strobes on gray cars = TCP control:
-        <span class="text-amber-300">SYN</span> ·
-        <span class="text-green-300">SYN-ACK</span> ·
-        <span class="text-purple-300">FIN</span> ·
-        <span class="text-red-300">RST</span></div>
-      <div class="text-slate-400">🔦 Shoulder flares = failed handshakes:
-        <span class="text-amber-300">no answer</span> ·
-        <span class="text-red-300">refused</span> — they stack per target (click them)</div>
-      <div class="text-slate-500 mt-1">right side → inbound · left side → outbound · road-train = burst of packets</div>
-      <div class="text-slate-500">⏱ same-lane spacing = real inter-arrival timing · click a vehicle to spotlight its flow</div>`);
+      <div class="mt-1 text-slate-400">🚦 Control cars (whole body =
+        <span class="text-amber-300">opening</span> ·
+        <span class="text-green-300">accepted</span> ·
+        <span class="text-purple-300">closing</span> ·
+        <span class="text-red-300">reset</span>)</div>
+      <div class="text-slate-400">🚨 Breakdowns on the shoulder = failures
+        (<span class="text-amber-300">no answer</span> ·
+        <span class="text-red-300">refused / bad name</span>) — repeats grow them; click for the story</div>
+      <div class="text-slate-500 mt-1">right side → inbound · left side → outbound · ×N road-train = burst · lane glow = load</div>
+      <div class="text-slate-500">⏱ same-lane spacing = real inter-arrival timing · click a vehicle or talker to spotlight</div>`);
     this.el['legend-list'].innerHTML = rows.join('');
   }
 
@@ -181,8 +240,8 @@ export class UI {
 
     const maxB = s.topTalkers[0]?.bytes || 1;
     this.el['talkers-list'].innerHTML = s.topTalkers.map((t) => `
-      <div class="flex items-center gap-2">
-        <span class="w-32 truncate text-slate-300" title="${esc(t.ip)}">${esc(t.ip)}</span>
+      <div class="flex items-center gap-2 cursor-pointer hover:bg-slate-800/60 rounded px-1 -mx-1" data-ip="${esc(t.ip)}" title="click to spotlight this host on the road">
+        <span class="w-32 truncate text-slate-300 pointer-events-none">${esc(t.ip)}</span>
         <div class="grow h-1.5 bg-slate-800 rounded-full overflow-hidden">
           <div class="h-full bg-cyan-500/80 rounded-full" style="width:${((t.bytes / maxB) * 100).toFixed(1)}%"></div>
         </div>
@@ -197,6 +256,7 @@ export class UI {
       this.el['tcph-refused'].textContent = c.refused.toLocaleString();
       this.el['tcph-rst'].textContent = c.resets.toLocaleString();
       this.el['tcph-retries'].textContent = c.synRetries.toLocaleString();
+      this.el['tcph-retrans'].textContent = c.retrans.toLocaleString();
       this.el['tcph-rtt'].textContent = flow.rtt
         ? `${flow.rtt.med.toFixed(0)} / ${flow.rtt.p95.toFixed(0)} ms`
         : '—';
@@ -259,12 +319,14 @@ export class UI {
     const dnsRow = p.dns_qr != null
       ? this.row('DNS', esc(`${p.dns_qr === 0 ? 'query' : 'response'}${p.dns_qname ? ' · ' + p.dns_qname : ''}${p.dns_qr === 1 ? ' · ' + ({ 0: 'NOERROR', 2: 'SERVFAIL', 3: 'NXDOMAIN' }[p.dns_rcode] ?? 'rcode ' + p.dns_rcode) : ''}`))
       : '';
+    const sni = p.sni ?? p._sni;
     return `
       <div class="flex items-center gap-2 mb-2 flex-wrap">
         <span class="badge" style="background:${protoColor}22;color:${protoColor}">${esc(p.proto)}</span>
         ${this.dirBadge(p.dir)}
         <span class="badge bg-slate-700/60 text-slate-300">${esc(p.transport)}</span>
         ${isBroadcast(p) ? '<span class="badge bg-amber-500/20 text-amber-300">📢 BROADCAST</span>' : ''}
+        ${p.retrans ? '<span class="badge bg-red-500/20 text-red-300">🔁 RETRANSMISSION</span>' : ''}
       </div>
       ${this.row('Timestamp', esc(fmtTime(p.ts)))}
       ${this.row('Epoch', esc(p.ts.toFixed(6)))}
@@ -277,6 +339,7 @@ export class UI {
       ${this.row('TCP flags', esc(flagStr))}
       ${p.icmp_type != null ? this.row('ICMP', esc(icmpName(p))) : ''}
       ${dnsRow}
+      ${sni ? this.row('Server name (SNI)', esc(sni)) : ''}
       ${this.row('Packet #', esc('#' + p.id))}
     `;
   }

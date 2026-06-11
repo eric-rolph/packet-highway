@@ -98,6 +98,39 @@ def _find_l4(ip_layer):
     return None
 
 
+def _extract_sni(raw: bytes) -> str | None:
+    """Server name from a TLS ClientHello, if this payload starts one.
+
+    Hand-rolled (no scapy TLS layer dependency): TLS record 0x16/0x03…,
+    handshake type 0x01, walk session-id/ciphers/compression to the
+    extensions and find server_name (type 0).
+    """
+    try:
+        if len(raw) < 60 or raw[0] != 0x16 or raw[1] != 0x03 or raw[5] != 0x01:
+            return None
+        idx = 9          # record header (5) + handshake type/len (4)
+        idx += 2 + 32    # client version + random
+        idx += 1 + raw[idx]                                    # session id
+        idx += 2 + int.from_bytes(raw[idx:idx + 2], "big")     # cipher suites
+        idx += 1 + raw[idx]                                    # compression
+        if idx + 2 > len(raw):
+            return None
+        ext_end = min(idx + 2 + int.from_bytes(raw[idx:idx + 2], "big"), len(raw))
+        idx += 2
+        while idx + 4 <= ext_end:
+            ext_type = int.from_bytes(raw[idx:idx + 2], "big")
+            ext_len = int.from_bytes(raw[idx + 2:idx + 4], "big")
+            idx += 4
+            if ext_type == 0 and idx + 5 <= ext_end:  # server_name
+                name_len = int.from_bytes(raw[idx + 3:idx + 5], "big")
+                name = raw[idx + 5:idx + 5 + name_len].decode("utf-8", "replace")
+                return name[:120] or None
+            idx += ext_len
+    except Exception:
+        pass
+    return None
+
+
 def summarize_packet(pkt: Packet, pid: int, ref_ips: set[str]) -> dict | None:
     """Reduce a scapy packet to the metadata the frontend needs."""
     try:
@@ -128,11 +161,17 @@ def summarize_packet(pkt: Packet, pid: int, ref_ips: set[str]) -> dict | None:
         sport = dport = None
         flags = ""
         icmp_type = icmp_code = None
+        seq = plen = None
+        sni = None
         l4 = _find_l4(ip_layer) if ip_layer is not None else None
         if isinstance(l4, TCP):
             transport = "TCP"
             sport, dport = int(l4.sport), int(l4.dport)
             flags = str(l4.flags)
+            seq = int(l4.seq)
+            plen = len(l4.payload)
+            if plen > 50 and 443 in (sport, dport):
+                sni = _extract_sni(bytes(l4.payload))
         elif isinstance(l4, UDP):
             transport = "UDP"
             sport, dport = int(l4.sport), int(l4.dport)
@@ -189,6 +228,9 @@ def summarize_packet(pkt: Packet, pid: int, ref_ips: set[str]) -> dict | None:
             "dns_qr": dns_qr,
             "dns_rcode": dns_rcode,
             "dns_qname": dns_qname,
+            "seq": seq,
+            "plen": plen,
+            "sni": sni,
             "dir": infer_dir(src, dst, ref_ips),
         }
     except Exception:

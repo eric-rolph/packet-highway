@@ -265,18 +265,81 @@ export class VehiclePool {
   }
 }
 
+/** Floating "×N" count labels for convoys — a small pool of canvas sprites. */
+export class LabelPool {
+  constructor(scene, cap = 24) {
+    this.entries = [];
+    this.free = [];
+    for (let i = 0; i < cap; i++) {
+      const canvas = document.createElement('canvas');
+      canvas.width = 128; canvas.height = 64;
+      const tex = new THREE.CanvasTexture(canvas);
+      const spr = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true, depthWrite: false }));
+      spr.scale.set(11, 5.5, 1);
+      spr.visible = false;
+      scene.add(spr);
+      this.entries.push({ spr, canvas, tex });
+      this.free.push(i);
+    }
+  }
+
+  acquire(text) {
+    const idx = this.free.pop();
+    if (idx === undefined) return -1;
+    const { canvas, tex, spr } = this.entries[idx];
+    const g = canvas.getContext('2d');
+    g.clearRect(0, 0, 128, 64);
+    g.font = 'bold 40px ui-monospace, monospace';
+    g.textAlign = 'center';
+    g.textBaseline = 'middle';
+    g.shadowColor = 'rgba(34,211,238,0.9)';
+    g.shadowBlur = 12;
+    g.fillStyle = '#e2e8f0';
+    g.fillText(text, 64, 32);
+    tex.needsUpdate = true;
+    spr.visible = true;
+    return idx;
+  }
+
+  position(idx, x, y, z) {
+    if (idx >= 0) this.entries[idx].spr.position.set(x, y, z);
+  }
+
+  release(idx) {
+    if (idx < 0) return;
+    this.entries[idx].spr.visible = false;
+    this.free.push(idx);
+  }
+}
+
+// A broken-down car pulled onto the shoulder, hazards blinking — the road
+// metaphor for "this connection/lookup failed here". Tilted and angled so it
+// reads as a wreck, not traffic; the whole body takes the failure tint.
+function buildWreck() {
+  const g = mergeGeometries([
+    box(1.9, 0.62, 4.1, 0, 0.74, 0, WHITE),
+    box(1.65, 0.55, 2.0, 0, 1.32, -0.15, GLASS),
+    box(0.8, 0.3, 0.8, 0, 1.78, 0.5, WHITE),        // hazard beacon block
+    wheel(0.42, 0.3, 0.85, 0.42, 1.3), wheel(0.42, 0.3, -0.85, 0.42, 1.3),
+    wheel(0.42, 0.3, 0.85, 0.42, -1.3), wheel(0.42, 0.3, -0.85, 0.42, -1.3),
+  ]);
+  g.rotateZ(0.15);   // sagging onto the shoulder
+  g.rotateY(0.55);   // pulled over at an angle
+  g.scale(1.4, 1.4, 1.4);
+  return g;
+}
+
 /**
- * Roadside markers for failed TCP handshakes: an amber flare (half-open, no
- * SYN-ACK) or red flare (connection refused / RST). Clickable like vehicles —
- * exposes the same {userData.pool, active} shape the Picker expects.
+ * Roadside breakdowns for failed TCP handshakes / DNS lookups: amber =
+ * unanswered, red = refused/NXDOMAIN. Clickable like vehicles — exposes the
+ * same {userData.pool, active} shape the Picker expects.
  */
 export class FlarePool {
   constructor(scene, cap = 64) {
     this.type = 'flare';
     this.cap = cap;
-    const geo = new THREE.ConeGeometry(1.3, 3.2, 8);
-    geo.translate(0, 1.6, 0);
-    this.mat = new THREE.MeshBasicMaterial({ transparent: true, opacity: 0.92 });
+    const geo = buildWreck();
+    this.mat = new THREE.MeshBasicMaterial({ transparent: true, opacity: 0.92, vertexColors: true });
     this.mesh = new THREE.InstancedMesh(geo, this.mat, cap);
     this.mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     this.mesh.frustumCulled = false;
@@ -343,16 +406,16 @@ export class FlarePool {
       const age = t - rec.born;
       if (age > this.ttl) { done.push(rec.idx); continue; }
       const fade = age > this.ttl - 2 ? (this.ttl - age) / 2 : 1;
-      const pulse = (1 + 0.15 * Math.sin(t * 6 + rec.idx)) * rec.boost;
+      const s = fade * rec.boost;
       _dummy.position.set(rec.x, 0, rec.z);
       _dummy.rotation.set(0, 0, 0);
-      _dummy.scale.set(pulse * fade, fade * rec.boost, pulse * fade);
+      _dummy.scale.set(s, s, s);
       _dummy.updateMatrix();
       this.mesh.setMatrixAt(rec.idx, _dummy.matrix);
     }
     for (const idx of done) this.release(idx);
     this.mesh.instanceMatrix.needsUpdate = true;
-    this.mat.opacity = 0.55 + 0.45 * Math.abs(Math.sin(t * 5));
+    this.mat.opacity = 0.45 + 0.55 * Math.abs(Math.sin(t * 5)); // hazard blink
   }
 
   clear() {
