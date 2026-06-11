@@ -23,7 +23,7 @@ vanilla ES modules) on the frontend. Demo video above.
 | SMB / FTP / VPN / MAIL | cargo vans | file & tunnel freight |
 | SSH / RDP / other TCP | sedans | interactive sessions |
 | ICMP | **police cars** (red/blue strobes) | the network's patrol & diagnostics |
-| TCP SYN / SYN-ACK / FIN / RST | gray cars with colored strobes | control plane made visible |
+| TCP SYN / SYN-ACK / FIN / RST | flag-colored cars (amber/green/purple/red) | control plane made visible |
 | UDP (DHCP, NTP, SNMP, syslog, QUIC…) | **drones** | connectionless — never touches the road |
 | ARP & other L2 | maintenance carts | slow housekeeping vehicles |
 | Packet bursts | **convoy road-trains** | one long hauler = N packets (click for the breakdown) |
