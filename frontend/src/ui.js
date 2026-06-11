@@ -2,7 +2,9 @@
 // packet/convoy/flare detail panel, playback bar, toasts. Pure view layer —
 // main.js supplies callbacks. The legend is generated from config.js so its
 // colors are, by construction, the colors used on the road.
-import { FLAG_NAMES, LEGEND, PROTO_CSS, isBroadcast } from './config.js';
+import { FAIL_RED, FLAG_COLORS, FLAG_NAMES, LEGEND, PROTO_CSS, THEME, isBroadcast } from './config.js';
+
+const hex = (n) => '#' + n.toString(16).padStart(6, '0');
 import { drawHistogram, drawSparkline } from './histogram.js';
 import { fmtBps, fmtBytes } from './stats.js';
 
@@ -52,7 +54,7 @@ export class UI {
       'tcph-est', 'tcph-pending', 'tcph-half', 'tcph-refused', 'tcph-rst',
       'tcph-retries', 'tcph-retrans', 'tcph-rtt', 'tcph-bar',
       'dnsh-ok', 'dnsh-nx', 'dnsh-sf', 'dnsh-to', 'dnsh-rtt',
-      'status-pill',
+      'status-pill', 'btn-theme',
       'detail-panel', 'detail-body', 'detail-close', 'playback-bar', 'btn-play',
       'sel-speed', 'time-cur', 'time-total', 'time-abs', 'scrub', 'hist-canvas',
       'toasts',
@@ -89,7 +91,16 @@ export class UI {
       else if (e.code === 'Digit1') this.cb.onCameraPreset(1);
       else if (e.code === 'Digit2') this.cb.onCameraPreset(2);
       else if (e.code === 'Digit3') this.cb.onCameraPreset(3);
+      else if (e.code === 'Digit4') this.cb.onCameraPreset(4);
     });
+
+    // colorblind-safe palette toggle
+    const themeBtn = this.el['btn-theme'];
+    if (THEME === 'colorblind') {
+      themeBtn.classList.add('bg-cyan-500/20', 'text-cyan-300', 'border-cyan-500/50');
+      themeBtn.title = 'colorblind-safe palette ON — click for the night palette';
+    }
+    themeBtn.addEventListener('click', () => this.cb.onThemeToggle());
 
     // health rows drill down into recent evidence
     const drill = {
@@ -156,13 +167,13 @@ export class UI {
               style="background:${l.css ?? PROTO_CSS[l.proto]}"></i>${esc(l.text)}</div>`);
     rows.push(`
       <div class="mt-1 text-slate-400">🚦 Control cars (whole body =
-        <span class="text-amber-300">opening</span> ·
-        <span class="text-green-300">accepted</span> ·
-        <span class="text-purple-300">closing</span> ·
-        <span class="text-red-300">reset</span>)</div>
+        <span style="color:${hex(FLAG_COLORS.S)}">opening</span> ·
+        <span style="color:${hex(FLAG_COLORS.SA)}">accepted</span> ·
+        <span style="color:${hex(FLAG_COLORS.F)}">closing</span> ·
+        <span style="color:${hex(FLAG_COLORS.R)}">reset</span>)</div>
       <div class="text-slate-400">🚨 Breakdowns on the shoulder = failures
         (<span class="text-amber-300">no answer</span> ·
-        <span class="text-red-300">refused / bad name</span>) — repeats grow them; click for the story</div>
+        <span style="color:${hex(FAIL_RED)}">refused / bad name</span>) — repeats grow them; click for the story</div>
       <div class="text-slate-500 mt-1">right side → inbound · left side → outbound · ×N road-train = burst · lane glow = load</div>
       <div class="text-slate-500">⏱ same-lane spacing = real inter-arrival timing · click a vehicle or talker to spotlight</div>`);
     this.el['legend-list'].innerHTML = rows.join('');

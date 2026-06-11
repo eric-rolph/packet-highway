@@ -16,7 +16,7 @@ import { computeBuckets } from './histogram.js';
 import { UI, fmtDur } from './ui.js';
 
 const canvas = document.getElementById('scene-canvas');
-const { renderer, scene, camera, composer, setPreset, update: updateCamera } = createScene(canvas);
+const { renderer, scene, camera, composer, setPreset, setChase, update: updateCamera } = createScene(canvas);
 const laneX = buildHighway(scene);
 const traffic = new TrafficController(scene, laneX);
 const stats = new StatsEngine(60);
@@ -118,7 +118,29 @@ const ui = new UI({
     seekTo((playback.t + sec - playback.meta.start) / playback.meta.duration);
   },
   onDetailClose() { picker.deselect(); },
-  onCameraPreset(n) { setPreset(n); },
+  onCameraPreset(n) {
+    if (n === 4) {
+      const sel = picker.selected;
+      if (sel?.rec && !sel.rec.gone) {
+        setChase(() => {
+          const s = picker.selected;
+          return s?.rec && !s.rec.gone ? s.rec : null;
+        });
+        ui.toast('Chase cam — riding with the selected packet. 1/2/3 or drag to exit.', 'info');
+      } else {
+        ui.toast('Click a vehicle first, then press 4 to chase it.', 'info');
+      }
+      return;
+    }
+    setPreset(n);
+  },
+  onThemeToggle() {
+    try {
+      const next = localStorage.getItem('ph-theme') === 'colorblind' ? 'night' : 'colorblind';
+      localStorage.setItem('ph-theme', next);
+    } catch { /* private mode */ }
+    location.reload();
+  },
   onTalkerClick(ip) {
     traffic.setHighlight({ type: 'host', key: ip });
     ui.toast(`Spotlighting ${ip} — everything touching this host stays lit. Click empty road to clear.`, 'info');

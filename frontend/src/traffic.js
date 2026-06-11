@@ -255,7 +255,7 @@ export class TrafficController {
     this.flares.spawn({
       x: side * this.shoulderX,
       z: dirSign * HALF_LEN * (0.12 + 0.76 * hash01(key)), // stable per target
-      color: event.kind === 'refused' ? 0xef4444 : 0xfbbf24,
+      color: event.kind === 'refused' ? FAIL_RED : 0xfbbf24,
       meta: { flowEvent: event.kind, syn, rst: event.rst ?? null },
       key,
     });
@@ -270,8 +270,8 @@ export class TrafficController {
       : `dns:${event.kind === 'dnstimeout' ? ref.dst : ref.src}`; // server
     const dirSign = ref.dir === 'in' ? 1 : -1;
     const side = ref.dir === 'in' ? 1 : -1;
-    const color = event.kind === 'nxdomain' ? 0xef4444
-      : event.kind === 'servfail' ? 0xf43f5e : 0xfbbf24;
+    const color = event.kind === 'nxdomain' ? FAIL_RED
+      : event.kind === 'servfail' ? (FAIL_RED === 0xef4444 ? 0xf43f5e : FAIL_RED) : 0xfbbf24;
     this.flares.spawn({
       x: side * this.shoulderX,
       z: dirSign * HALF_LEN * (0.12 + 0.76 * hash01(key)),

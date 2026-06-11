@@ -105,14 +105,70 @@ export function buildHighway(scene) {
     group.add(inner);
   }
 
-  // Lane label sprites at both ends of each lane, both sides
+  // Lane labels live ON the gantries (like real overhead signage) instead of
+  // floating mid-air, where they stacked into word soup at low camera angles.
+  const signPlate = (text, tint) => {
+    const c = document.createElement('canvas');
+    c.width = 256; c.height = 56;
+    const g = c.getContext('2d');
+    g.fillStyle = 'rgba(8, 14, 28, 0.94)';
+    g.fillRect(0, 0, 256, 56);
+    g.strokeStyle = tint;
+    g.lineWidth = 3;
+    g.strokeRect(2, 2, 252, 52);
+    g.font = 'bold 26px ui-monospace, monospace';
+    g.textAlign = 'center';
+    g.textBaseline = 'middle';
+    g.fillStyle = tint;
+    g.fillText(text, 128, 30);
+    const tex = new THREE.CanvasTexture(c);
+    return new THREE.MeshBasicMaterial({ map: tex, transparent: true, toneMapped: false });
+  };
+  const plateGeo = new THREE.PlaneGeometry(7.4, 1.9);
+  for (const gateZ of [HALF_LEN + 6, -HALF_LEN - 6]) {
+    LANES.forEach((lane, i) => {
+      for (const side of [1, -1]) {
+        const mat = signPlate(lane.label, side > 0 ? '#67e8f9' : '#f0abfc');
+        for (const face of [1, -1]) { // readable from both directions
+          const m = new THREE.Mesh(plateGeo, mat);
+          m.position.set(side * laneOffset(i), 23.3, gateZ + face * 1.6);
+          if (face < 0) m.rotation.y = Math.PI;
+          group.add(m);
+        }
+      }
+    });
+  }
+
+  // Faint lane names painted on the asphalt for mid-road orientation —
+  // foreshortened at low angles exactly like real road paint.
+  const paintGeo = new THREE.PlaneGeometry(5.6, 2.4);
+  const paintCache = {};
+  const roadPaint = (key) => {
+    if (!paintCache[key]) {
+      const c = document.createElement('canvas');
+      c.width = 192; c.height = 80;
+      const g = c.getContext('2d');
+      g.font = 'bold 44px ui-monospace, monospace';
+      g.textAlign = 'center';
+      g.textBaseline = 'middle';
+      g.fillStyle = '#cbd5e1';
+      g.fillText(key, 96, 42);
+      const tex = new THREE.CanvasTexture(c);
+      paintCache[key] = new THREE.MeshBasicMaterial({
+        map: tex, transparent: true, opacity: 0.26, depthWrite: false,
+      });
+    }
+    return paintCache[key];
+  };
   LANES.forEach((lane, i) => {
     for (const side of [1, -1]) {
-      const x = side * laneOffset(i);
-      for (const endZ of [HALF_LEN - 18, -HALF_LEN + 18]) {
-        const spr = textSprite(lane.label, side > 0 ? '#67e8f9' : '#f0abfc', 0.55);
-        spr.position.set(x, 7.5, endZ);
-        group.add(spr);
+      for (const z of [-130, 90]) {
+        const m = new THREE.Mesh(paintGeo, roadPaint(lane.key));
+        m.rotation.x = -Math.PI / 2;
+        m.rotation.z = side > 0 ? Math.PI : 0; // baseline faces oncoming drivers
+        m.position.set(side * laneOffset(i), 0.03, z + side * 25);
+        m.raycast = () => {};
+        group.add(m);
       }
     }
   });
@@ -141,14 +197,18 @@ export function buildHighway(scene) {
     group.add(arch);
   }
 
-  // Tiny skyline behind the LOCALHOST end — somewhere for packets to "arrive".
+  // Tiny skyline behind the LOCALHOST end — somewhere for packets to "arrive",
+  // with lit windows so it reads as a city at night, not cargo crates.
   const rng = mulberry32(42);
   const cityGeoms = [];
+  const windowGeoms = [];
   const cityMat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.7 });
+  const warm = new THREE.Color(0xffd9a0), cool = new THREE.Color(0x9fd8ff);
   for (let i = 0; i < 46; i++) {
     const w = 6 + rng() * 14, h = 8 + rng() * 46, d = 6 + rng() * 14;
+    const bx = (rng() - 0.5) * totalW * 2.6, bz = HALF_LEN + 40 + rng() * 130;
     const g = new THREE.BoxGeometry(w, h, d);
-    g.translate((rng() - 0.5) * totalW * 2.6, h / 2, HALF_LEN + 40 + rng() * 130);
+    g.translate(bx, h / 2, bz);
     const shade = 0.05 + rng() * 0.07;
     const col = new THREE.Color(shade, shade * 1.3, shade * 2.2);
     const n = g.attributes.position.count;
@@ -156,9 +216,38 @@ export function buildHighway(scene) {
     for (let v = 0; v < n; v++) col.toArray(colors, v * 3);
     g.setAttribute('color', new THREE.BufferAttribute(colors, 3));
     cityGeoms.push(g);
+    // window grid on the road-facing wall
+    const cols = Math.max(Math.floor(w / 2.2), 1);
+    const rows = Math.max(Math.floor(h / 3.2), 1);
+    for (let r = 0; r < rows; r++) {
+      for (let cidx = 0; cidx < cols; cidx++) {
+        if (rng() > 0.42) continue; // most windows dark
+        const wg = new THREE.PlaneGeometry(0.95, 1.35);
+        wg.rotateY(Math.PI);
+        wg.translate(
+          bx - w / 2 + (cidx + 0.5) * (w / cols),
+          2.2 + r * 3.2,
+          bz - d / 2 - 0.06,
+        );
+        const wc = rng() < 0.7 ? warm : cool;
+        const wn = wg.attributes.position.count;
+        const warr = new Float32Array(wn * 3);
+        for (let v = 0; v < wn; v++) wc.toArray(warr, v * 3);
+        wg.setAttribute('color', new THREE.BufferAttribute(warr, 3));
+        windowGeoms.push(wg);
+      }
+    }
   }
   import('three/addons/utils/BufferGeometryUtils.js').then(({ mergeGeometries }) => {
     group.add(new THREE.Mesh(mergeGeometries(cityGeoms), cityMat));
+    if (windowGeoms.length) {
+      const winMesh = new THREE.Mesh(
+        mergeGeometries(windowGeoms),
+        new THREE.MeshBasicMaterial({ vertexColors: true, toneMapped: false }),
+      );
+      winMesh.raycast = () => {};
+      group.add(winMesh);
+    }
   });
 
   scene.add(group);

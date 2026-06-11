@@ -159,7 +159,12 @@ mode and PCAP mode never need privileges.
 
 * **Drag** to orbit · **scroll** to zoom · **click any vehicle/breakdown** for details
 * **Camera presets**: `1` overview · `2` top-down (lanes become a barcode
-  timeline — same-lane spacing is literal inter-arrival time) · `3` gate cam
+  timeline — same-lane spacing is literal inter-arrival time) · `3` gate cam ·
+  `4` chase the selected vehicle (click one first; auto-returns when it exits)
+* **CB button** (header): colorblind-safe palette (Okabe-Ito based — no
+  red-vs-green anywhere, failures become vermillion); persists in localStorage
+* Lane labels are mounted on the gate gantries (plus faint road paint), so
+  low camera angles stay readable
 * The look is full night-highway: ACES tone mapping + bloom, headlights/
   taillights on every vehicle (white = coming at you, red = leaving — a
   direction cue, not just decoration), image-based lighting on bodies/glass,

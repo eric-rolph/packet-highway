@@ -10,7 +10,39 @@
 // ghosting) is geometrically impossible. Near-simultaneous arrivals take
 // the parallel sub-lane; bursts beyond both sub-lanes become convoys.
 
-export const PROTO_COLORS = {
+// Theme: 'night' (default) or 'colorblind' — a deuteranopia-oriented palette
+// (Okabe-Ito based) that never leans on red-vs-green. Picked at load from
+// ?theme= or localStorage; the legend regenerates from whatever is active.
+export const THEME = (() => {
+  try {
+    const q = new URLSearchParams(location.search).get('theme');
+    return (q ?? localStorage.getItem('ph-theme')) === 'colorblind' ? 'colorblind' : 'night';
+  } catch {
+    return 'night';
+  }
+})();
+const CB = THEME === 'colorblind';
+
+export const PROTO_COLORS = CB ? {
+  HTTPS:  0x0072b2, // blue
+  HTTP:   0xe69f00, // orange
+  DNS:    0xf0e442, // yellow
+  ICMP:   0xf1f5f9, // white
+  SSH:    0x56b4e9, // sky
+  RDP:    0xcc79a7, // mauve
+  SNMP:   0x009e73, // teal-green
+  DHCP:   0x35c297,
+  NTP:    0x88ccee,
+  SYSLOG: 0xaa4499,
+  VPN:    0x7c6fd0,
+  MAIL:   0x44aa99,
+  SMB:    0xddaa33,
+  FTP:    0xb85c7a,
+  TCP:    0x94a3b8,
+  UDP:    0xbbbbdd,
+  ARP:    0xd6d3d1,
+  OTHER:  0x64748b,
+} : {
   HTTPS:  0x10b981, // emerald — encrypted web (incl. QUIC)
   HTTP:   0xf97316, // orange  — cleartext web (deliberately "warning" colored)
   DNS:    0xfacc15, // yellow
@@ -35,8 +67,10 @@ export const PROTO_CSS = Object.fromEntries(
   Object.entries(PROTO_COLORS).map(([k, v]) => [k, '#' + v.toString(16).padStart(6, '0')])
 );
 
-// Strobe colors for TCP control (signal cars)
-export const FLAG_COLORS = { S: 0xfbbf24, SA: 0x4ade80, F: 0xc084fc, FA: 0xc084fc, R: 0xf87171, RA: 0xf87171 };
+// TCP control car body colors (opening / accepted / closing / reset)
+export const FLAG_COLORS = CB
+  ? { S: 0xe69f00, SA: 0x56b4e9, F: 0xcc79a7, FA: 0xcc79a7, R: 0xd55e00, RA: 0xd55e00 }
+  : { S: 0xfbbf24, SA: 0x4ade80, F: 0xc084fc, FA: 0xc084fc, R: 0xf87171, RA: 0xf87171 };
 
 // Lane speed = world units/sec for EVERY vehicle in that lane (see header).
 export const LANES = [
@@ -139,8 +173,9 @@ export const FLAG_NAMES = {
   F: 'FIN', S: 'SYN', R: 'RST', P: 'PSH', A: 'ACK', U: 'URG', E: 'ECE', C: 'CWR',
 };
 
-// Failure tint shared by DNS-failure motorcycles and ICMP error cruisers.
-export const FAIL_RED = 0xef4444;
+// Failure tint shared by DNS-failure motorcycles, ICMP error cruisers,
+// retransmissions, and shoulder wrecks. Vermillion under the CB theme.
+export const FAIL_RED = CB ? 0xd55e00 : 0xef4444;
 
 // Representative color per lane, for the stacked scrubber histogram.
 export const LANE_REPR = {

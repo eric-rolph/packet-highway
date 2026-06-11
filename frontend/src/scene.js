@@ -89,13 +89,15 @@ export function createScene(canvas) {
   composer.addPass(bloom);
   composer.addPass(new OutputPass());
 
-  // smooth camera-preset tweens; any manual drag cancels the tween
+  // smooth camera-preset tweens + chase cam; any manual drag cancels both
   let tween = null;
-  controls.addEventListener('start', () => { tween = null; });
+  let chase = null; // () => vehicle rec | null
+  controls.addEventListener('start', () => { tween = null; chase = null; });
 
   function setPreset(n) {
     const p = PRESETS[n];
     if (!p) return;
+    chase = null;
     tween = {
       t0: performance.now(),
       fromPos: camera.position.clone(), toPos: new THREE.Vector3(...p.pos),
@@ -103,8 +105,34 @@ export function createScene(canvas) {
     };
   }
 
+  /** Follow a vehicle: getter returns its rec each frame, null when gone. */
+  function setChase(getter) {
+    tween = null;
+    chase = getter;
+  }
+
+  const _chasePos = new THREE.Vector3();
+  const _chaseTarget = new THREE.Vector3();
+  let lastNow = performance.now();
+
   function update(now) {
-    if (tween) {
+    const dt = Math.min((now - lastNow) / 1000, 0.1);
+    lastNow = now;
+    if (chase) {
+      const r = chase();
+      if (!r) {
+        chase = null;
+        setPreset(1); // the vehicle reached its gate — drift back to overview
+      } else {
+        const d = r.dirSign;
+        const side = r.x >= 0 ? 9 : -9;
+        _chasePos.set(r.x + side, 10, r.z - d * 17);
+        _chaseTarget.set(r.x, 2, r.z + d * 14);
+        const k = 1 - Math.exp(-4.5 * dt);
+        camera.position.lerp(_chasePos, k);
+        controls.target.lerp(_chaseTarget, k);
+      }
+    } else if (tween) {
       const a = Math.min((now - tween.t0) / 1100, 1);
       const e = a < 0.5 ? 2 * a * a : 1 - ((-2 * a + 2) ** 2) / 2;
       camera.position.lerpVectors(tween.fromPos, tween.toPos, e);
@@ -123,5 +151,5 @@ export function createScene(canvas) {
     composer.setSize(window.innerWidth, window.innerHeight);
   });
 
-  return { renderer, scene, camera, controls, composer, setPreset, update };
+  return { renderer, scene, camera, controls, composer, setPreset, setChase, update };
 }
