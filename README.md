@@ -11,12 +11,7 @@ network live, or replay a `.pcap` with full scrub/seek control.
 
 Built with **FastAPI + Scapy** on the backend and **Three.js** (zero-build,
 vanilla ES modules) on the frontend.
-
-### ▶ Demo video
-
-[![Packet Highway demo](https://img.youtube.com/vi/oALYgxMnnMw/hqdefault.jpg)](https://youtu.be/oALYgxMnnMw)
-
-*Click to watch on YouTube: <https://youtu.be/oALYgxMnnMw>*
+**Demo video:** <https://youtu.be/oALYgxMnnMw> (thumbnail above).
 
 ---
 
