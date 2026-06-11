@@ -89,15 +89,17 @@ export function createScene(canvas) {
   composer.addPass(bloom);
   composer.addPass(new OutputPass());
 
-  // smooth camera-preset tweens + chase cam; any manual drag cancels both
+  // smooth camera-preset tweens + chase cam + auto-orbit; drag cancels all
   let tween = null;
   let chase = null; // () => vehicle rec | null
-  controls.addEventListener('start', () => { tween = null; chase = null; });
+  let orbit = null; // {a, r, h} slow cinematic orbit
+  controls.addEventListener('start', () => { tween = null; chase = null; orbit = null; });
 
   function setPreset(n) {
     const p = PRESETS[n];
     if (!p) return;
     chase = null;
+    orbit = null;
     tween = {
       t0: performance.now(),
       fromPos: camera.position.clone(), toPos: new THREE.Vector3(...p.pos),
@@ -108,7 +110,21 @@ export function createScene(canvas) {
   /** Follow a vehicle: getter returns its rec each frame, null when gone. */
   function setChase(getter) {
     tween = null;
+    orbit = null;
     chase = getter;
+  }
+
+  /** Slow cinematic orbit (b-roll). Enters from the current camera pose. */
+  function setOrbit() {
+    tween = null;
+    chase = null;
+    const dx = camera.position.x - controls.target.x;
+    const dz = camera.position.z - controls.target.z;
+    orbit = {
+      a: Math.atan2(dx, dz),
+      r: Math.min(Math.max(Math.hypot(dx, dz), 200), 430),
+      h: Math.min(Math.max(camera.position.y, 70), 240),
+    };
   }
 
   const _chasePos = new THREE.Vector3();
@@ -132,6 +148,13 @@ export function createScene(canvas) {
         camera.position.lerp(_chasePos, k);
         controls.target.lerp(_chaseTarget, k);
       }
+    } else if (orbit) {
+      orbit.a += dt * 0.05;
+      camera.position.set(
+        controls.target.x + Math.sin(orbit.a) * orbit.r,
+        orbit.h,
+        controls.target.z + Math.cos(orbit.a) * orbit.r,
+      );
     } else if (tween) {
       const a = Math.min((now - tween.t0) / 1100, 1);
       const e = a < 0.5 ? 2 * a * a : 1 - ((-2 * a + 2) ** 2) / 2;
@@ -151,5 +174,5 @@ export function createScene(canvas) {
     composer.setSize(window.innerWidth, window.innerHeight);
   });
 
-  return { renderer, scene, camera, controls, composer, setPreset, setChase, update };
+  return { renderer, scene, camera, controls, composer, setPreset, setChase, setOrbit, update };
 }

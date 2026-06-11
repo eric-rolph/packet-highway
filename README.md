@@ -160,7 +160,13 @@ mode and PCAP mode never need privileges.
 * **Drag** to orbit · **scroll** to zoom · **click any vehicle/breakdown** for details
 * **Camera presets**: `1` overview · `2` top-down (lanes become a barcode
   timeline — same-lane spacing is literal inter-arrival time) · `3` gate cam ·
-  `4` chase the selected vehicle (click one first; auto-returns when it exits)
+  `4` chase the selected vehicle (click one first; auto-returns when it exits) ·
+  `5` slow auto-orbit (b-roll)
+* **`Space` in live mode freezes the road** — vehicles stop mid-flight so you
+  can click the fast ones; analysis and stats keep counting underneath
+  (in PCAP mode `Space` is play/pause, as before)
+* **📷 button** saves a PNG of the current view; the bandwidth sparkline is
+  stacked by lane color, and TCP HEALTH includes currently-open connections
 * **CB button** (header): colorblind-safe palette (Okabe-Ito based — no
   red-vs-green anywhere, failures become vermillion); persists in localStorage
 * Lane labels are mounted on the gate gantries (plus faint road paint), so

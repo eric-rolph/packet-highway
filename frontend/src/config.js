@@ -84,7 +84,7 @@ export const LANES = [
 ];
 export const LANE_SPEED = Object.fromEntries(LANES.map((l) => [l.key, l.speed]));
 
-const PROTO_LANE = {
+export const PROTO_LANE = {
   HTTP: 'WEB', HTTPS: 'WEB',
   DNS: 'DNS',
   SSH: 'MGMT', RDP: 'MGMT',

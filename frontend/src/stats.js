@@ -4,7 +4,10 @@
 // Aggregates into per-second buckets at add() time, so snapshot cost depends
 // on the window length (≤60 buckets), not the packet rate — at thousands of
 // packets/sec the old per-event array melted the frame budget.
-import { isBroadcast } from './config.js';
+import { LANES, PROTO_LANE, isBroadcast } from './config.js';
+
+const LANE_IDX = Object.fromEntries(LANES.map((l, i) => [l.key, i]));
+const N_LANES = LANES.length;
 
 export class StatsEngine {
   constructor(windowSec = 60) {
@@ -56,11 +59,13 @@ export class StatsEngine {
     const protos = new Map();
     const talkers = new Map();
     const series = new Float64Array(this.windowSec); // bytes/sec, oldest first
+    const laneSeries = new Float64Array(this.windowSec * N_LANES); // stacked by lane
 
     for (const [sec, b] of this.buckets) {
       const age = nowSec - sec;
       if (age < 0 || age >= this.windowSec) continue;
-      series[this.windowSec - 1 - age] += b.bytes;
+      const col = this.windowSec - 1 - age;
+      series[col] += b.bytes;
       winPkts += b.pkts;
       bcastWin += b.bcast;
       if (age <= 1) { bwIn += b.bytesIn; bwOut += b.bytesOut; }
@@ -69,6 +74,7 @@ export class StatsEngine {
         const agg = protos.get(proto) ?? { pkts: 0, bytes: 0 };
         agg.pkts += v.pkts; agg.bytes += v.bytes;
         protos.set(proto, agg);
+        laneSeries[col * N_LANES + (LANE_IDX[PROTO_LANE[proto] ?? 'OTHER'] ?? N_LANES - 1)] += v.bytes;
       }
       for (const [ip, v] of b.talkers) {
         const agg = talkers.get(ip) ?? { bytes: 0, pkts: 0 };
@@ -95,6 +101,7 @@ export class StatsEngine {
         .sort((a, b) => b.bytes - a.bytes)
         .slice(0, 5),
       buckets: series,
+      laneSeries,
     };
   }
 }

@@ -31,6 +31,7 @@ export class FlowTracker {
     this.recentFail = new Map();  // same key -> last failure time
     this.seqHi = new Map();       // directional flow -> highest seq end seen
     this.flowSni = new Map();     // canonical flow key -> TLS server name
+    this.open = new Map();        // canonical flow key -> ts established
     this.rtts = [];               // ms, rolling
     this.log = [];                // recent failure events for drill-down
     this.counts = {};
@@ -42,6 +43,7 @@ export class FlowTracker {
     this.recentFail.clear();
     this.seqHi.clear();
     this.flowSni.clear();
+    this.open.clear();
     this.rtts.length = 0;
     this.log.length = 0;
     this.counts = {
@@ -133,14 +135,19 @@ export class FlowTracker {
         this.pending.delete(rkey);
         this.recentFail.delete(rkey);
         this.counts.established++;
+        if (this.open.size >= 5000) this.open.delete(this.open.keys().next().value);
+        this.open.set(flowKeyOf(p), p.ts);
         const rtt = (p.ts - pend.t) * 1000;
         if (rtt >= 0 && rtt < 10_000) {
           this.rtts.push(rtt);
           if (this.rtts.length > 200) this.rtts.shift();
         }
       }
+    } else if (f.includes('F')) {
+      this.open.delete(flowKeyOf(p)); // FIN starts teardown — count it closed
     } else if (isRst) {
       this.counts.resets++;
+      this.open.delete(flowKeyOf(p));
       this.pushLog('rst', `${p.src} → ${p.dst}${p.dport != null ? ':' + p.dport : ''}`);
       const pend = this.pending.get(rkey);
       if (pend) {
@@ -182,6 +189,9 @@ export class FlowTracker {
   }
 
   get pendingCount() { return this.pending.size; }
+
+  /** Connections currently established (seen open, not yet FIN/RST). */
+  get openCount() { return this.open.size; }
 
   /** Rolling handshake RTT {med, p95, n} in ms, or null before any sample. */
   get rttStats() {

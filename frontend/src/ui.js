@@ -54,7 +54,7 @@ export class UI {
       'tcph-est', 'tcph-pending', 'tcph-half', 'tcph-refused', 'tcph-rst',
       'tcph-retries', 'tcph-retrans', 'tcph-rtt', 'tcph-bar',
       'dnsh-ok', 'dnsh-nx', 'dnsh-sf', 'dnsh-to', 'dnsh-rtt',
-      'status-pill', 'btn-theme',
+      'status-pill', 'btn-theme', 'btn-shot', 'frozen-pill', 'tcph-open',
       'detail-panel', 'detail-body', 'detail-close', 'playback-bar', 'btn-play',
       'sel-speed', 'time-cur', 'time-total', 'time-abs', 'scrub', 'hist-canvas',
       'toasts',
@@ -92,7 +92,9 @@ export class UI {
       else if (e.code === 'Digit2') this.cb.onCameraPreset(2);
       else if (e.code === 'Digit3') this.cb.onCameraPreset(3);
       else if (e.code === 'Digit4') this.cb.onCameraPreset(4);
+      else if (e.code === 'Digit5') this.cb.onCameraPreset(5);
     });
+    this.el['btn-shot'].addEventListener('click', () => this.cb.onScreenshot());
 
     // colorblind-safe palette toggle
     const themeBtn = this.el['btn-theme'];
@@ -126,6 +128,11 @@ export class UI {
       const ip = e.target.closest('[data-ip]')?.dataset.ip;
       if (ip) this.cb.onTalkerClick(ip);
     });
+  }
+
+  /** Freeze-frame indicator for live mode. */
+  setFrozen(frozen) {
+    this.el['frozen-pill'].classList.toggle('hidden', !frozen);
   }
 
   /** Glanceable verdict: 'ok' | 'degraded' | 'problem' + reason list. */
@@ -240,7 +247,7 @@ export class UI {
     this.el['stat-total'].textContent =
       `${s.totalPkts.toLocaleString()} pkts · ${fmtBytes(s.totalBytes)}`
       + (s.bcastWin > 0 ? ` · ${s.bcastWin.toLocaleString()} bcast` : '');
-    drawSparkline(this.el['spark-canvas'], s.buckets);
+    drawSparkline(this.el['spark-canvas'], s.buckets, s.laneSeries);
 
     this.el['proto-list'].innerHTML = s.protoDist.slice(0, 8).map((p) => `
       <div class="flex items-center gap-2">
@@ -266,6 +273,7 @@ export class UI {
       const c = flow.counts;
       this.el['tcph-est'].textContent = c.established.toLocaleString();
       this.el['tcph-pending'].textContent = flow.pending.toLocaleString();
+      this.el['tcph-open'].textContent = (flow.open ?? 0).toLocaleString();
       this.el['tcph-half'].textContent = c.halfOpen.toLocaleString();
       this.el['tcph-refused'].textContent = c.refused.toLocaleString();
       this.el['tcph-rst'].textContent = c.resets.toLocaleString();

@@ -16,7 +16,7 @@ import { computeBuckets } from './histogram.js';
 import { UI, fmtDur } from './ui.js';
 
 const canvas = document.getElementById('scene-canvas');
-const { renderer, scene, camera, composer, setPreset, setChase, update: updateCamera } = createScene(canvas);
+const { renderer, scene, camera, composer, setPreset, setChase, setOrbit, update: updateCamera } = createScene(canvas);
 const laneX = buildHighway(scene);
 const traffic = new TrafficController(scene, laneX);
 const stats = new StatsEngine(60);
@@ -28,6 +28,8 @@ let mode = 'live';
 let liveDropped = 0;
 let lastStormWarn = -1e9;
 let currentReasons = [];
+let frozen = false;     // live mode: road frozen for inspection (stats continue)
+let shotPending = false;
 const statusRing = []; // counter snapshots for windowed status verdicts
 
 function trackPacket(p) {
@@ -50,6 +52,8 @@ function resetWorld() {
   dns.reset();
   liveDropped = 0;
   statusRing.length = 0; // counters restarted — stale baselines would go negative
+  frozen = false;
+  ui.setFrozen(false);
   picker.deselect();
 }
 
@@ -64,7 +68,7 @@ const live = new LiveSource({
   onPackets: (items, dropped) => {
     if (mode !== 'live') return;
     for (const p of items) trackPacket(p); // analysis first (retrans/SNI marks)
-    traffic.ingestBatch(items, 110);
+    if (!frozen) traffic.ingestBatch(items, 110); // frozen road: count, don't spawn
     liveDropped = dropped;
   },
   onError: (msg) => ui.toast(msg, 'error'),
@@ -107,7 +111,14 @@ const ui = new UI({
     }
   },
   onPlayToggle() {
-    if (mode !== 'pcap' || !playback.loaded) return;
+    if (mode === 'live') {
+      // freeze-frame: stop the road so fast vehicles can be inspected/clicked;
+      // analysis and stats keep running on the live stream underneath
+      frozen = !frozen;
+      ui.setFrozen(frozen);
+      return;
+    }
+    if (!playback.loaded) return;
     if (playback.atEnd) { seekTo(0); }
     playback.playing = !playback.playing;
   },
@@ -119,6 +130,11 @@ const ui = new UI({
   },
   onDetailClose() { picker.deselect(); },
   onCameraPreset(n) {
+    if (n === 5) {
+      setOrbit();
+      ui.toast('Auto-orbit — drag or press 1/2/3 to take back control.', 'info');
+      return;
+    }
     if (n === 4) {
       const sel = picker.selected;
       if (sel?.rec && !sel.rec.gone) {
@@ -134,6 +150,7 @@ const ui = new UI({
     }
     setPreset(n);
   },
+  onScreenshot() { shotPending = true; },
   onThemeToggle() {
     try {
       const next = localStorage.getItem('ph-theme') === 'colorblind' ? 'night' : 'colorblind';
@@ -231,12 +248,23 @@ function step(now, render) {
     if (render) ui.updatePlayback(playback);
   }
 
-  traffic.update(dt, t);
+  if (!(frozen && mode === 'live')) traffic.update(dt, t);
 
   if (render) {
     picker.update(t);
     updateCamera(now);
     composer.render();
+    if (shotPending) {
+      shotPending = false;
+      canvas.toBlob((blob) => { // capture in the same frame the buffer is valid
+        if (!blob) return;
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = `packet-highway-${new Date().toISOString().replace(/[:.]/g, '-')}.png`;
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+      });
+    }
   }
 
   uiTimer += dt;
@@ -249,6 +277,7 @@ function step(now, render) {
     ui.renderStats(snap, {
       counts: flows.counts,
       pending: flows.pendingCount,
+      open: flows.openCount,
       rtt: flows.rttStats,
     }, {
       counts: dns.counts,

@@ -73,27 +73,35 @@ export function drawHistogram(canvas, H, playheadFrac) {
   g.fillRect(x - 0.75, 0, 1.5, h);
 }
 
-export function drawSparkline(canvas, buckets) {
+/** Bandwidth sparkline stacked by lane — same color language as the road. */
+export function drawSparkline(canvas, totals, laneSeries) {
   const { g, w, h } = prepCanvas(canvas);
   g.clearRect(0, 0, w, h);
+  const n = totals.length;
   let max = 1;
-  for (const v of buckets) if (v > max) max = v;
-  const bw = w / buckets.length;
-  g.beginPath();
-  g.moveTo(0, h);
-  for (let i = 0; i < buckets.length; i++) {
-    g.lineTo((i + 0.5) * bw, h - (buckets[i] / max) * (h - 4));
+  for (const v of totals) if (v > max) max = v;
+  const bw = w / n;
+  const L = LANE_KEYS.length;
+  for (let i = 0; i < n; i++) {
+    let y = h;
+    for (let l = 0; l < L; l++) {
+      const v = laneSeries ? laneSeries[i * L + l] : 0;
+      if (!v) continue;
+      const seg = (v / max) * (h - 4);
+      g.fillStyle = LANE_CSS[l];
+      g.globalAlpha = 0.85;
+      g.fillRect(i * bw, y - seg, Math.max(bw - 0.5, 0.75), seg);
+      y -= seg;
+    }
   }
-  g.lineTo(w, h);
-  g.closePath();
-  g.fillStyle = 'rgba(34, 211, 238, 0.18)';
-  g.fill();
+  g.globalAlpha = 1;
+  // total envelope line on top
   g.beginPath();
-  for (let i = 0; i < buckets.length; i++) {
-    const x = (i + 0.5) * bw, y = h - (buckets[i] / max) * (h - 4);
+  for (let i = 0; i < n; i++) {
+    const x = (i + 0.5) * bw, y = h - (totals[i] / max) * (h - 4);
     i === 0 ? g.moveTo(x, y) : g.lineTo(x, y);
   }
-  g.strokeStyle = 'rgba(34, 211, 238, 0.85)';
-  g.lineWidth = 1.5;
+  g.strokeStyle = 'rgba(226, 232, 240, 0.5)';
+  g.lineWidth = 1;
   g.stroke();
 }
