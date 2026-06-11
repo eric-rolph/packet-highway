@@ -178,7 +178,7 @@ export class VehiclePool {
     this.recycled = 0;
   }
 
-  /** opts: {laneX, dirSign, color, scaleL, meta, beaconColor} */
+  /** opts: {x, dirSign, color, scaleL, len, yBase, meta, beaconColor} */
   spawn(opts) {
     let idx = this.free.pop();
     if (idx === undefined) {
@@ -187,15 +187,21 @@ export class VehiclePool {
       idx = this.free.pop();
       this.recycled++;
     }
+    const speed = this.baseSpeed * (0.9 + Math.random() * 0.2);
     const rec = {
       idx,
-      laneX: opts.laneX + (Math.random() - 0.5) * 1.6,
+      x: opts.x,
+      targetX: opts.x,
       dirSign: opts.dirSign,
-      z: -opts.dirSign * (HALF_LEN + 4 + Math.random() * 6),
-      speed: this.baseSpeed * (0.9 + Math.random() * 0.2),
+      z: opts.z ?? -opts.dirSign * (HALF_LEN + 4),
+      speed,            // own preferred speed
+      curSpeed: speed,  // clamped by the follow model each frame
       scaleL: opts.scaleL ?? 1,
-      yBase: 0,
+      len: (opts.len ?? 4) * (opts.scaleL ?? 1),
+      yBase: opts.yBase ?? 0,
       bobPhase: Math.random() * Math.PI * 2,
+      changeCd: 0,
+      gone: false,
       meta: opts.meta,
     };
     this.active.set(idx, rec);
@@ -209,7 +215,10 @@ export class VehiclePool {
   }
 
   release(idx) {
-    if (!this.active.delete(idx)) return;
+    const rec = this.active.get(idx);
+    if (!rec) return;
+    rec.gone = true; // sub-lane queues compact lazily
+    this.active.delete(idx);
     this.mesh.setMatrixAt(idx, parkMatrix());
     if (this.beacons) this.beacons.setMatrixAt(idx, parkMatrix());
     this.free.push(idx);
@@ -219,10 +228,11 @@ export class VehiclePool {
     const done = [];
     const droneY = this.type === 'drone';
     for (const rec of this.active.values()) {
-      rec.z += rec.dirSign * rec.speed * dt;
+      rec.z += rec.dirSign * rec.curSpeed * dt;
+      rec.x += (rec.targetX - rec.x) * Math.min(1, dt * 5); // lane-change glide
       if (Math.abs(rec.z) > HALF_LEN + 16) { done.push(rec.idx); continue; }
-      const y = droneY ? 4 + Math.sin(t * 3 + rec.bobPhase) * 0.7 : 0;
-      _dummy.position.set(rec.laneX, y, rec.z);
+      const y = droneY ? rec.yBase + Math.sin(t * 3 + rec.bobPhase) * 0.45 : 0;
+      _dummy.position.set(rec.x, y, rec.z);
       _dummy.rotation.set(0, rec.dirSign > 0 ? 0 : Math.PI, 0);
       _dummy.scale.set(1, 1, rec.scaleL);
       _dummy.updateMatrix();
@@ -286,7 +296,7 @@ export class FlarePool {
       this.release(oldest);
       idx = this.free.pop();
     }
-    this.active.set(idx, { idx, laneX: x, z, yBase: 0, born: -1, meta });
+    this.active.set(idx, { idx, x, z, yBase: 0, born: -1, meta });
     this.mesh.setColorAt(idx, _color.set(color));
     this.mesh.instanceColor.needsUpdate = true;
   }
@@ -305,7 +315,7 @@ export class FlarePool {
       if (age > this.ttl) { done.push(rec.idx); continue; }
       const fade = age > this.ttl - 2 ? (this.ttl - age) / 2 : 1;
       const pulse = 1 + 0.15 * Math.sin(t * 6 + rec.idx);
-      _dummy.position.set(rec.laneX, 0, rec.z);
+      _dummy.position.set(rec.x, 0, rec.z);
       _dummy.rotation.set(0, 0, 0);
       _dummy.scale.set(pulse * fade, fade, pulse * fade);
       _dummy.updateMatrix();

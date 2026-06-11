@@ -55,8 +55,8 @@ export class Picker {
     if (!this.selected) return;
     const rec = this.selected.pool.active.get(this.selected.idx);
     if (!rec) { this.selected = null; this.ring.visible = false; return; }
-    const y = this.selected.pool.type === 'drone' ? 4 : 0.25;
-    this.ring.position.set(rec.laneX, rec.yBase + y, rec.z);
+    const y = this.selected.pool.type === 'drone' ? rec.yBase : rec.yBase + 0.25;
+    this.ring.position.set(rec.x, y, rec.z);
     const s = 1 + 0.12 * Math.sin(t * 5);
     this.ring.scale.set(s, s, s);
   }

@@ -51,14 +51,25 @@ const PROTO_LANE = {
 
 export const HIGHWAY = {
   length: 620,
-  laneWidth: 7,
+  laneWidth: 8.4,   // wide enough for two sub-lanes (cruise + passing)
   medianWidth: 11,
   shoulder: 8,
 };
 export const HALF_LEN = HIGHWAY.length / 2;
 
+// Each protocol lane is split into two sub-lanes so faster vehicles can
+// overtake instead of ghosting through slower ones: sub 0 = passing (inner,
+// nearer the median), sub 1 = cruise (outer).
+export const SUBLANE_OFFSET = 2.1;
+
 export function laneOffset(i) {
   return HIGHWAY.medianWidth / 2 + (i + 0.5) * HIGHWAY.laneWidth;
+}
+
+/** World X of a sub-lane center. dir 'in' drives on +X, 'out' on -X. */
+export function sublaneX(laneCenterX, dir, sub) {
+  const sign = dir === 'in' ? 1 : -1;
+  return laneCenterX + (sub === 0 ? -1 : 1) * sign * SUBLANE_OFFSET;
 }
 
 export function laneFor(p) {
@@ -92,18 +103,22 @@ export function vehicleTypeFor(p) {
   return 'cart';
 }
 
-// speed = world units/sec, cap = instance pool size
+// speed = world units/sec, cap = instance pool size,
+// len = visual length at scale 1 (used for follow-gap math)
 export const TYPE_SPECS = {
-  motorcycle: { speed: 95, cap: 280 },
-  van:        { speed: 55, cap: 260 },
-  truck:      { speed: 40, cap: 160 },
-  sedan:      { speed: 62, cap: 320 },
-  police:     { speed: 70, cap: 140 },
-  signal:     { speed: 75, cap: 220 },
-  drone:      { speed: 48, cap: 200 },
-  cart:       { speed: 38, cap: 140 },
-  convoy:     { speed: 45, cap: 120 },
+  motorcycle: { speed: 95, cap: 280, len: 3.2 },
+  van:        { speed: 55, cap: 260, len: 5.6 },
+  truck:      { speed: 40, cap: 160, len: 8.6 },
+  sedan:      { speed: 62, cap: 320, len: 5.0 },
+  police:     { speed: 70, cap: 140, len: 5.0 },
+  signal:     { speed: 75, cap: 220, len: 3.8 },
+  drone:      { speed: 48, cap: 200, len: 2.4 },
+  cart:       { speed: 38, cap: 140, len: 3.2 },
+  convoy:     { speed: 45, cap: 120, len: 11.0 },
 };
+
+// Vehicles at or above this base speed prefer the passing sub-lane.
+export const PASS_SPEED = 60;
 
 // Minimum time between vehicles entering the same lane (prevents overlap);
 // bursts beyond this are merged into convoys.

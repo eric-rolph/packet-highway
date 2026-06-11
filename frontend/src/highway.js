@@ -66,15 +66,24 @@ export function buildHighway(scene) {
   centerLine.position.y = 0.31;
   group.add(centerLine);
 
-  // Dashed separators + glowing outer edges, mirrored per side.
+  // Dashed separators + glowing outer edges, mirrored per side. Each protocol
+  // lane also gets a fainter center divider splitting it into two sub-lanes
+  // (cruise + passing).
   const dashes = dashTexture();
-  const dashMat = new THREE.MeshBasicMaterial({ map: dashes, transparent: true, opacity: 0.5, depthWrite: false });
+  const dashMat = new THREE.MeshBasicMaterial({ map: dashes, transparent: true, opacity: 0.55, depthWrite: false });
+  const subDashMat = new THREE.MeshBasicMaterial({ map: dashes, transparent: true, opacity: 0.16, depthWrite: false });
   for (const side of [1, -1]) {
     for (let i = 1; i < nLanes; i++) {
       const x = side * (HIGHWAY.medianWidth / 2 + i * HIGHWAY.laneWidth);
       const m = new THREE.Mesh(new THREE.PlaneGeometry(0.35, HIGHWAY.length), dashMat);
       m.rotation.x = -Math.PI / 2;
       m.position.set(x, 0.02, 0);
+      group.add(m);
+    }
+    for (let i = 0; i < nLanes; i++) {
+      const m = new THREE.Mesh(new THREE.PlaneGeometry(0.28, HIGHWAY.length), subDashMat);
+      m.rotation.x = -Math.PI / 2;
+      m.position.set(side * laneOffset(i), 0.02, 0);
       group.add(m);
     }
     // outer edge glow: cyan = inbound side (+X), fuchsia = outbound (-X)

@@ -12,6 +12,12 @@ network live, or replay a `.pcap` with full scrub/seek control.
 Built with **FastAPI + Scapy** on the backend and **Three.js** (zero-build,
 vanilla ES modules) on the frontend.
 
+### ▶ Demo video
+
+[![Packet Highway demo](https://img.youtube.com/vi/oALYgxMnnMw/hqdefault.jpg)](https://youtu.be/oALYgxMnnMw)
+
+*Click to watch on YouTube: <https://youtu.be/oALYgxMnnMw>*
+
 ---
 
 ## The metaphor
@@ -33,12 +39,22 @@ glowing `LOCALHOST` gate; the left side flows **outbound** toward `INTERNET`.
 
 ### Density: how packets become bandwidth
 
-At low rates you see literal packets. Each lane enforces a minimum headway, so
-vehicles never overlap; when a burst exceeds what a lane can admit, the burst is
-merged into a single **convoy** scaled by packet count — the same shift from
-packet-level to flow-level view that tools like sFlow/NetFlow make at scale.
-**Every packet is always counted in the dashboard stats**; only the visual
-aggregates. The `MERGED` HUD counter tells you how many packets rode in convoys.
+At low rates you see literal packets. Each lane enforces a minimum admission
+headway; when a burst exceeds what a lane can admit, the burst is merged into a
+single **convoy** scaled by packet count — the same shift from packet-level to
+flow-level view that tools like sFlow/NetFlow make at scale. **Every packet is
+always counted in the dashboard stats**; only the visual aggregates. The
+`MERGED` HUD counter tells you how many packets rode in convoys.
+
+### No ghosting: sub-lanes and car-following
+
+Every protocol lane is split into two sub-lanes — **cruise** (outer) and
+**passing** (inner). Within a sub-lane, vehicles obey a follow-the-leader
+model: a faster vehicle closes up, matches the leader's speed, and merges into
+the passing sub-lane to overtake when there's a safe gap (with a closing-speed
+allowance, like a real merge). Vehicles therefore never drive through each
+other — fast SYN cars visibly weave past heavy HTTPS trucks instead of ghosting
+through them. UDP drones are airborne and separate by altitude instead of lanes.
 
 ### TCP handshake troubleshooting
 
