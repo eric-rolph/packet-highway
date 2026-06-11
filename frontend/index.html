@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Packet Highway — 3D Network Traffic Visualizer</title>
+  <link rel="icon" href="data:," />
+  <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/"
+      }
+    }
+  </script>
+  <style>
+    html, body { height: 100%; margin: 0; background: #05080f; overscroll-behavior: none; }
+    #scene-canvas { position: fixed; inset: 0; display: block; touch-action: none; }
+    .panel { background: rgba(10, 15, 28, 0.78); backdrop-filter: blur(10px);
+             border: 1px solid rgba(70, 90, 130, 0.35); border-radius: 0.75rem; }
+    .num { font-variant-numeric: tabular-nums; }
+    ::-webkit-scrollbar { width: 8px; height: 8px; }
+    ::-webkit-scrollbar-thumb { background: #2b3a55; border-radius: 4px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    /* Scrubber: transparent track (histogram canvas sits behind), visible thumb */
+    input[type="range"].scrub { -webkit-appearance: none; appearance: none; background: transparent; cursor: pointer; }
+    input[type="range"].scrub::-webkit-slider-runnable-track { height: 100%; background: transparent; }
+    input[type="range"].scrub::-webkit-slider-thumb { -webkit-appearance: none; appearance: none;
+      width: 4px; height: 48px; border-radius: 2px; background: #f8fafc;
+      box-shadow: 0 0 8px rgba(56,189,248,.9); margin-top: 0; }
+    input[type="range"].scrub::-moz-range-track { background: transparent; }
+    input[type="range"].scrub::-moz-range-thumb { width: 4px; height: 48px; border: 0; border-radius: 2px;
+      background: #f8fafc; box-shadow: 0 0 8px rgba(56,189,248,.9); }
+    select, input[type="text"] { outline: none; }
+    .badge { display: inline-flex; align-items: center; padding: 0 .45rem; height: 1.15rem;
+             border-radius: .3rem; font-size: .65rem; font-weight: 700; letter-spacing: .04em; }
+  </style>
+</head>
+<body class="text-slate-200 font-sans overflow-hidden select-none">
+  <canvas id="scene-canvas"></canvas>
+
+  <!-- ======================= UI OVERLAY ======================= -->
+  <div class="fixed inset-0 pointer-events-none flex flex-col">
+
+    <!-- Top bar -->
+    <header class="pointer-events-auto m-3 mb-0 panel flex items-center gap-4 px-4 py-2.5 flex-wrap">
+      <div class="flex items-center gap-2.5 mr-2">
+        <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-cyan-400 to-fuchsia-500 grid place-items-center text-slate-950 font-black text-sm shadow-[0_0_16px_rgba(34,211,238,.5)]">PH</div>
+        <div>
+          <h1 class="text-sm font-bold tracking-[0.18em] text-slate-100 leading-none">PACKET HIGHWAY</h1>
+          <p class="text-[10px] text-slate-400 leading-tight mt-0.5">3D network traffic visualizer</p>
+        </div>
+      </div>
+
+      <!-- Mode tabs -->
+      <nav class="flex rounded-lg overflow-hidden border border-slate-700 text-xs font-semibold">
+        <button id="tab-live" class="px-4 py-1.5 bg-cyan-500/20 text-cyan-300">LIVE</button>
+        <button id="tab-pcap" class="px-4 py-1.5 text-slate-400 hover:text-slate-200">PCAP</button>
+      </nav>
+
+      <!-- Live controls -->
+      <div id="live-controls" class="flex items-center gap-2 text-xs">
+        <select id="iface-select" class="bg-slate-800/80 border border-slate-700 rounded-md px-2 py-1.5 max-w-56 text-slate-200">
+          <option value="__demo__">Demo traffic (no capture)</option>
+        </select>
+        <input id="bpf-input" type="text" placeholder="BPF filter, e.g. tcp port 443"
+               class="bg-slate-800/80 border border-slate-700 rounded-md px-2 py-1.5 w-44 placeholder:text-slate-500" />
+        <button id="btn-capture"
+                class="px-4 py-1.5 rounded-md font-bold bg-emerald-500/90 hover:bg-emerald-400 text-emerald-950 transition-colors">
+          ▶ START
+        </button>
+      </div>
+
+      <!-- PCAP controls -->
+      <div id="pcap-controls" class="hidden flex items-center gap-2 text-xs">
+        <label class="px-3 py-1.5 rounded-md bg-slate-800/80 border border-slate-700 hover:border-cyan-500 cursor-pointer transition-colors">
+          📁 Open .pcap…
+          <input id="file-input" type="file" accept=".pcap,.pcapng,.cap" class="hidden" />
+        </label>
+        <button id="btn-sample" class="px-3 py-1.5 rounded-md bg-fuchsia-500/20 border border-fuchsia-500/50 text-fuchsia-300 hover:bg-fuchsia-500/30 transition-colors">
+          ✨ Load sample capture
+        </button>
+        <span id="pcap-meta" class="text-slate-400"></span>
+      </div>
+
+      <div class="grow"></div>
+      <div id="hud" class="num text-[11px] text-slate-400 flex gap-4">
+        <span>FPS <b id="hud-fps" class="text-slate-100">—</b></span>
+        <span>VEHICLES <b id="hud-active" class="text-slate-100">0</b></span>
+        <span>PKT/S <b id="hud-pps" class="text-slate-100">0</b></span>
+        <span title="packets merged into convoys to keep lanes readable">MERGED <b id="hud-merged" class="text-slate-100">0</b></span>
+      </div>
+    </header>
+
+    <!-- Middle row: stats left, detail right -->
+    <div class="flex-1 flex items-stretch justify-between min-h-0 p-3 gap-3">
+
+      <!-- Stats panel -->
+      <aside class="pointer-events-auto panel w-72 p-4 flex flex-col gap-4 overflow-y-auto self-start max-h-full">
+        <section>
+          <h2 class="text-[10px] font-bold tracking-[0.2em] text-slate-400 mb-2">BANDWIDTH</h2>
+          <div class="grid grid-cols-2 gap-2">
+            <div class="bg-slate-800/50 rounded-lg p-2.5">
+              <div class="text-[10px] text-cyan-400 font-semibold">▼ INBOUND</div>
+              <div id="stat-bw-in" class="num text-lg font-bold text-slate-50">0 bps</div>
+            </div>
+            <div class="bg-slate-800/50 rounded-lg p-2.5">
+              <div class="text-[10px] text-fuchsia-400 font-semibold">▲ OUTBOUND</div>
+              <div id="stat-bw-out" class="num text-lg font-bold text-slate-50">0 bps</div>
+            </div>
+          </div>
+          <canvas id="spark-canvas" class="w-full h-14 mt-2 rounded-md bg-slate-900/60"></canvas>
+          <div class="flex justify-between text-[10px] text-slate-500 mt-1 num">
+            <span id="stat-total">0 pkts · 0 B</span><span>last 60 s</span>
+          </div>
+        </section>
+
+        <section>
+          <h2 class="text-[10px] font-bold tracking-[0.2em] text-slate-400 mb-2">PROTOCOLS <span class="text-slate-600">60 s window</span></h2>
+          <div id="proto-list" class="flex flex-col gap-1.5 text-xs"></div>
+        </section>
+
+        <section>
+          <h2 class="text-[10px] font-bold tracking-[0.2em] text-slate-400 mb-2">TCP HEALTH <span class="text-slate-600">handshakes</span></h2>
+          <div class="grid grid-cols-2 gap-x-3 gap-y-1 text-xs num">
+            <div class="flex justify-between"><span class="text-slate-400">✓ established</span><b id="tcph-est" class="text-emerald-400">0</b></div>
+            <div class="flex justify-between"><span class="text-slate-400">⏳ pending</span><b id="tcph-pending" class="text-slate-200">0</b></div>
+            <div class="flex justify-between"><span class="text-slate-400">⚠ half-open</span><b id="tcph-half" class="text-amber-400">0</b></div>
+            <div class="flex justify-between"><span class="text-slate-400">⛔ refused</span><b id="tcph-refused" class="text-red-400">0</b></div>
+            <div class="flex justify-between col-span-2"><span class="text-slate-400">RST seen</span><b id="tcph-rst" class="text-red-300">0</b></div>
+          </div>
+          <div class="h-1.5 bg-slate-800 rounded-full overflow-hidden mt-2" title="handshake success ratio">
+            <div id="tcph-bar" class="h-full rounded-full bg-emerald-500" style="width:100%"></div>
+          </div>
+        </section>
+
+        <section>
+          <h2 class="text-[10px] font-bold tracking-[0.2em] text-slate-400 mb-2">TOP TALKERS <span class="text-slate-600">by bytes</span></h2>
+          <div id="talkers-list" class="flex flex-col gap-1.5 text-xs num"></div>
+        </section>
+
+        <section class="border-t border-slate-700/60 pt-3">
+          <h2 class="text-[10px] font-bold tracking-[0.2em] text-slate-400 mb-2">LEGEND</h2>
+          <div id="legend-list" class="grid grid-cols-1 gap-1 text-[11px] text-slate-300"></div>
+        </section>
+      </aside>
+
+      <!-- Detail panel -->
+      <aside id="detail-panel" class="pointer-events-auto panel w-80 p-4 self-start hidden">
+        <div class="flex items-center justify-between mb-3">
+          <h2 class="text-[10px] font-bold tracking-[0.2em] text-slate-400">PACKET DETAIL</h2>
+          <button id="detail-close" class="text-slate-500 hover:text-slate-200 text-lg leading-none">×</button>
+        </div>
+        <div id="detail-body" class="text-xs"></div>
+      </aside>
+    </div>
+
+    <!-- Bottom: hint + playback -->
+    <footer class="p-3 pt-0 flex flex-col gap-2">
+      <div class="text-center text-[10px] text-slate-600 pointer-events-none">
+        drag to orbit · scroll to zoom · click a vehicle for packet details
+      </div>
+      <div id="playback-bar" class="pointer-events-auto panel hidden px-4 py-3 items-center gap-4">
+        <button id="btn-play" class="w-10 h-10 rounded-full bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold text-sm grid place-items-center transition-colors shrink-0">▶</button>
+        <select id="sel-speed" class="bg-slate-800/80 border border-slate-700 rounded-md px-2 py-1.5 text-xs shrink-0">
+          <option value="0.25">0.25×</option>
+          <option value="0.5">0.5×</option>
+          <option value="1" selected>1×</option>
+          <option value="2">2×</option>
+          <option value="4">4×</option>
+          <option value="8">8×</option>
+          <option value="16">16×</option>
+        </select>
+        <div class="relative grow h-12">
+          <canvas id="hist-canvas" class="absolute inset-0 w-full h-full rounded-md bg-slate-900/70"></canvas>
+          <input id="scrub" type="range" min="0" max="1000" value="0" class="scrub absolute inset-0 w-full h-full" />
+        </div>
+        <div class="num text-xs text-slate-300 w-44 text-right shrink-0">
+          <span id="time-cur" class="text-slate-50 font-semibold">0:00.0</span> / <span id="time-total">0:00.0</span>
+          <div id="time-abs" class="text-[10px] text-slate-500"></div>
+        </div>
+      </div>
+    </footer>
+  </div>
+
+  <!-- Toasts -->
+  <div id="toasts" class="fixed top-16 right-3 z-50 flex flex-col gap-2 w-96 pointer-events-none"></div>
+
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>

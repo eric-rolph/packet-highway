@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+*.pcap
+*.pcapng
+.claude/
+.DS_Store
