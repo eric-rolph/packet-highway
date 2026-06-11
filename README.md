@@ -1,7 +1,7 @@
 # Packet Highway
 
-<a href="https://youtu.be/yz4h0zBZ9Ps" target="_blank">
-  <img src="https://img.youtube.com/vi/yz4h0zBZ9Ps/maxresdefault.jpg" alt="Watch the video" width="600" />
+<a href="https://youtu.be/A6Bwlk_j62g" target="_blank">
+  <img src="https://img.youtube.com/vi/A6Bwlk_j62g/maxresdefault.jpg" alt="Watch the video" width="600" />
 </a>
 
 **A 3D network traffic visualizer.** Packets become vehicles on a divided highway:
