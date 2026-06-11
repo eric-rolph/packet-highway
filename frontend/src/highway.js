@@ -124,7 +124,7 @@ export function buildHighway(scene) {
   ]) {
     const arch = new THREE.Group();
     const postMat = new THREE.MeshStandardMaterial({
-      color: 0x1e293b, emissive: new THREE.Color(color), emissiveIntensity: 0.25, roughness: 0.6,
+      color: 0x1e293b, emissive: new THREE.Color(color), emissiveIntensity: 1.4, roughness: 0.6,
     });
     for (const side of [1, -1]) {
       const post = new THREE.Mesh(new THREE.BoxGeometry(2.2, 26, 2.2), postMat);

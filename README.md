@@ -157,7 +157,13 @@ mode and PCAP mode never need privileges.
 
 ## UI guide
 
-* **Drag** to orbit · **scroll** to zoom · **click any vehicle/flare** for details
+* **Drag** to orbit · **scroll** to zoom · **click any vehicle/breakdown** for details
+* **Camera presets**: `1` overview · `2` top-down (lanes become a barcode
+  timeline — same-lane spacing is literal inter-arrival time) · `3` gate cam
+* The look is full night-highway: ACES tone mapping + bloom, headlights/
+  taillights on every vehicle (white = coming at you, red = leaving — a
+  direction cue, not just decoration), image-based lighting on bodies/glass,
+  starfield, glowing gates, and per-lane utilization glow
 * **PCAP mode**: histogram scrubber with per-bucket packet counts, play/pause
   (`Space`), seek (`←`/`→`), speeds 0.25×–16×
 * **Dashboard**: in/out bandwidth + 60 s sparkline, protocol distribution,

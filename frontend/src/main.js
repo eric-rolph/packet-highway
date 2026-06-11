@@ -16,7 +16,7 @@ import { computeBuckets } from './histogram.js';
 import { UI, fmtDur } from './ui.js';
 
 const canvas = document.getElementById('scene-canvas');
-const { renderer, scene, camera, controls } = createScene(canvas);
+const { renderer, scene, camera, composer, setPreset, update: updateCamera } = createScene(canvas);
 const laneX = buildHighway(scene);
 const traffic = new TrafficController(scene, laneX);
 const stats = new StatsEngine(60);
@@ -118,6 +118,7 @@ const ui = new UI({
     seekTo((playback.t + sec - playback.meta.start) / playback.meta.duration);
   },
   onDetailClose() { picker.deselect(); },
+  onCameraPreset(n) { setPreset(n); },
   onTalkerClick(ip) {
     traffic.setHighlight({ type: 'host', key: ip });
     ui.toast(`Spotlighting ${ip} — everything touching this host stays lit. Click empty road to clear.`, 'info');
@@ -212,8 +213,8 @@ function step(now, render) {
 
   if (render) {
     picker.update(t);
-    controls.update();
-    renderer.render(scene, camera);
+    updateCamera(now);
+    composer.render();
   }
 
   uiTimer += dt;

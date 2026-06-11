@@ -129,6 +129,30 @@ const _color = new THREE.Color();
 const POLICE_RED = new THREE.Color(0xef4444);
 const POLICE_BLUE = new THREE.Color(0x3b82f6);
 
+// headlight/taillight strips per type: [half-width of light placement]
+const LIGHT_X = {
+  motorcycle: 0, sedan: 0.62, van: 0.72, truck: 0.78,
+  police: 0.62, signal: 0.55, cart: 0.42, convoy: 0.75,
+};
+
+// White up front, red at the rear — with bloom these read as real traffic
+// at night, and double as a direction cue.
+function lightsGeometry(type, len) {
+  const x = LIGHT_X[type] ?? 0.6;
+  const half = len / 2;
+  const parts = [
+    box(0.4, 0.18, 0.12, x, 0.72, half + 0.02, 0xffffff),
+    box(0.36, 0.16, 0.12, x, 0.74, -half - 0.02, 0xff2a2a),
+  ];
+  if (x > 0) {
+    parts.push(
+      box(0.4, 0.18, 0.12, -x, 0.72, half + 0.02, 0xffffff),
+      box(0.36, 0.16, 0.12, -x, 0.74, -half - 0.02, 0xff2a2a),
+    );
+  }
+  return mergeGeometries(parts);
+}
+
 function parkMatrix() {
   _dummy.position.set(0, -1000, 0);
   _dummy.rotation.set(0, 0, 0);
@@ -156,6 +180,18 @@ export class VehiclePool {
       this.mesh.setColorAt(i, _color.set(0xffffff));
     }
     scene.add(this.mesh);
+
+    // unlit, un-tone-mapped lights so bloom catches them (drones fly dark)
+    this.lights = null;
+    if (type !== 'drone') {
+      const lmat = new THREE.MeshBasicMaterial({ vertexColors: true, toneMapped: false });
+      this.lights = new THREE.InstancedMesh(lightsGeometry(type, spec.len), lmat, this.cap);
+      this.lights.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+      this.lights.frustumCulled = false;
+      this.lights.raycast = () => {};
+      for (let i = 0; i < this.cap; i++) this.lights.setMatrixAt(i, parkMatrix());
+      scene.add(this.lights);
+    }
 
     this.beacons = null;
     if (this.hasBeacon) {
@@ -198,6 +234,7 @@ export class VehiclePool {
       len: (opts.len ?? 4) * (opts.scaleL ?? 1),
       yBase: opts.yBase ?? 0,
       bobPhase: Math.random() * Math.PI * 2,
+      born: -1, // set on first update; drives the spawn scale-in
       gone: false,
       baseColor: opts.color,
       meta: opts.meta,
@@ -218,6 +255,7 @@ export class VehiclePool {
     rec.gone = true; // sub-lane queues compact lazily
     this.active.delete(idx);
     this.mesh.setMatrixAt(idx, parkMatrix());
+    if (this.lights) this.lights.setMatrixAt(idx, parkMatrix());
     if (this.beacons) this.beacons.setMatrixAt(idx, parkMatrix());
     this.free.push(idx);
   }
@@ -235,21 +273,26 @@ export class VehiclePool {
       rec.z += rec.dirSign * rec.speed * dt;
       // cull only past the EXIT gate (z grows toward travel direction)
       if (rec.z * rec.dirSign > HALF_LEN + 16) { done.push(rec.idx); continue; }
+      if (rec.born < 0) rec.born = t;
+      const ramp = Math.min((t - rec.born) / 0.25, 1);
+      const grow = ramp * (2 - ramp); // ease-out scale-in at the gate
       const y = droneY ? rec.yBase + Math.sin(t * 3 + rec.bobPhase) * 0.45 : 0;
       _dummy.position.set(rec.x, y, rec.z);
       _dummy.rotation.set(0, rec.dirSign > 0 ? 0 : Math.PI, 0);
-      _dummy.scale.set(1, 1, rec.scaleL);
+      _dummy.scale.set(grow, grow, rec.scaleL * grow);
       _dummy.updateMatrix();
       this.mesh.setMatrixAt(rec.idx, _dummy.matrix);
+      if (this.lights) this.lights.setMatrixAt(rec.idx, _dummy.matrix);
       if (this.beacons) {
         _dummy.position.y = y + (this.type === 'police' ? 1.85 : 1.72);
-        _dummy.scale.set(1, 1, 1);
+        _dummy.scale.set(grow, grow, grow);
         _dummy.updateMatrix();
         this.beacons.setMatrixAt(rec.idx, _dummy.matrix);
       }
     }
     for (const idx of done) this.release(idx);
     this.mesh.instanceMatrix.needsUpdate = true;
+    if (this.lights) this.lights.instanceMatrix.needsUpdate = true;
     if (this.beacons) {
       this.beacons.instanceMatrix.needsUpdate = true;
       this.beaconMat.opacity = 0.3 + 0.7 * Math.abs(Math.sin(t * 9));
@@ -406,7 +449,8 @@ export class FlarePool {
       const age = t - rec.born;
       if (age > this.ttl) { done.push(rec.idx); continue; }
       const fade = age > this.ttl - 2 ? (this.ttl - age) / 2 : 1;
-      const s = fade * rec.boost;
+      const ramp = Math.min(age / 0.3, 1);
+      const s = ramp * (2 - ramp) * fade * rec.boost;
       _dummy.position.set(rec.x, 0, rec.z);
       _dummy.rotation.set(0, 0, 0);
       _dummy.scale.set(s, s, s);

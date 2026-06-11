@@ -86,6 +86,9 @@ export class UI {
       if (e.code === 'Space') { e.preventDefault(); this.cb.onPlayToggle(); }
       else if (e.code === 'ArrowRight') this.cb.onSeekRelative(5);
       else if (e.code === 'ArrowLeft') this.cb.onSeekRelative(-5);
+      else if (e.code === 'Digit1') this.cb.onCameraPreset(1);
+      else if (e.code === 'Digit2') this.cb.onCameraPreset(2);
+      else if (e.code === 'Digit3') this.cb.onCameraPreset(3);
     });
 
     // health rows drill down into recent evidence
