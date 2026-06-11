@@ -25,6 +25,20 @@ QUEUE_CAP = 6000  # drop (but count) packets beyond this backlog
 MAX_BATCH = 2000
 
 
+_LOCAL_IPS: set[str] | None = None
+_LOCAL_IPS_LOCK = asyncio.Lock()
+
+
+async def _local_ips_cached() -> set[str]:
+    """get_local_ips() can hit DNS / enumerate NICs — run it off-loop, once."""
+    global _LOCAL_IPS
+    if _LOCAL_IPS is None:
+        async with _LOCAL_IPS_LOCK:
+            if _LOCAL_IPS is None:
+                _LOCAL_IPS = await asyncio.to_thread(get_local_ips)
+    return _LOCAL_IPS
+
+
 class LiveSession:
     def __init__(self, ws: WebSocket, iface: str | None, bpf: str | None, demo: bool):
         self.ws = ws
@@ -37,7 +51,7 @@ class LiveSession:
         self.sniffer = None
 
     async def run(self) -> None:
-        local_ips = get_local_ips()
+        local_ips = await _local_ips_cached()
         await self.ws.send_text(json.dumps({
             "type": "hello",
             "mode": "demo" if self.demo else "live",
@@ -112,6 +126,15 @@ class LiveSession:
 
         while True:
             await asyncio.sleep(BATCH_INTERVAL)
+            # the sniffer thread can die later too (NIC sleep/unplug, driver
+            # error) — tell the client instead of streaming silence forever
+            thread = getattr(self.sniffer, "thread", None)
+            if thread is not None and not thread.is_alive():
+                await self._send_error(
+                    "Capture stopped: the sniffer thread exited "
+                    "(interface down, driver error, or invalid filter)."
+                )
+                return
             items = []
             while not self.queue.empty() and len(items) < MAX_BATCH:
                 items.append(self.queue.get_nowait())

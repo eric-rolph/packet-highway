@@ -27,7 +27,7 @@ PORT_CLASSES: list[tuple[str, set[int]]] = [
     ("DNS", {53, 5353, 5355}),
     ("HTTPS", {443, 8443}),          # includes QUIC (udp/443)
     ("HTTP", {80, 8080, 8000, 8008}),
-    ("SSH", {22, 23}),
+    ("SSH", {22}),  # telnet/23 deliberately falls through to plain TCP
     ("RDP", {3389}),
     ("SMB", {445, 139, 137, 138}),
     ("FTP", {20, 21}),
@@ -72,6 +72,32 @@ def infer_dir(src: str | None, dst: str | None, ref_ips: set[str]) -> str:
     return "out"
 
 
+try:
+    from scapy.layers.inet6 import _ICMPv6  # base class of all ICMPv6 layers
+except ImportError:  # pragma: no cover - very old scapy
+    class _ICMPv6:  # type: ignore[no-redef]
+        pass
+
+from scapy.packet import NoPayload
+
+
+def _find_l4(ip_layer):
+    """First transport layer under the FIRST IP header.
+
+    Walks IPv6 extension headers but stops at a nested IP layer, so tunneled
+    traffic (GRE, 6in4, VXLAN…) is summarized by its OUTER header instead of
+    mixing outer addresses with inner ports.
+    """
+    cur = ip_layer.payload
+    for _ in range(8):
+        if cur is None or isinstance(cur, (NoPayload, IP, IPv6)):
+            return None
+        if isinstance(cur, (TCP, UDP, ICMP, _ICMPv6)):
+            return cur
+        cur = cur.payload
+    return None
+
+
 def summarize_packet(pkt: Packet, pid: int, ref_ips: set[str]) -> dict | None:
     """Reduce a scapy packet to the metadata the frontend needs."""
     try:
@@ -86,13 +112,14 @@ def summarize_packet(pkt: Packet, pid: int, ref_ips: set[str]) -> dict | None:
         ttl = None
         proto_num = None
         transport = "OTHER"
+        ip_layer = None
 
         if IP in pkt:
-            ip = pkt[IP]
-            src, dst, ttl, proto_num = ip.src, ip.dst, int(ip.ttl), int(ip.proto)
+            ip_layer = pkt[IP]
+            src, dst, ttl, proto_num = ip_layer.src, ip_layer.dst, int(ip_layer.ttl), int(ip_layer.proto)
         elif IPv6 in pkt:
-            ip6 = pkt[IPv6]
-            src, dst, ttl, proto_num = ip6.src, ip6.dst, int(ip6.hlim), int(ip6.nh)
+            ip_layer = pkt[IPv6]
+            src, dst, ttl, proto_num = ip_layer.src, ip_layer.dst, int(ip_layer.hlim), int(ip_layer.nh)
         elif ARP in pkt:
             arp = pkt[ARP]
             src, dst = arp.psrc, arp.pdst
@@ -100,17 +127,28 @@ def summarize_packet(pkt: Packet, pid: int, ref_ips: set[str]) -> dict | None:
 
         sport = dport = None
         flags = ""
-        if TCP in pkt:
-            t = pkt[TCP]
+        icmp_type = icmp_code = None
+        l4 = _find_l4(ip_layer) if ip_layer is not None else None
+        if isinstance(l4, TCP):
             transport = "TCP"
-            sport, dport = int(t.sport), int(t.dport)
-            flags = str(t.flags)
-        elif UDP in pkt:
-            u = pkt[UDP]
+            sport, dport = int(l4.sport), int(l4.dport)
+            flags = str(l4.flags)
+        elif isinstance(l4, UDP):
             transport = "UDP"
-            sport, dport = int(u.sport), int(u.dport)
-        elif ICMP in pkt or (proto_num in (1, 58)):
+            sport, dport = int(l4.sport), int(l4.dport)
+        elif isinstance(l4, ICMP):
             transport = "ICMP"
+            icmp_type, icmp_code = int(l4.type), int(l4.code)
+        elif isinstance(l4, _ICMPv6):
+            transport = "ICMP"
+            icmp_type = int(getattr(l4, "type", 0) or 0)
+            icmp_code = int(getattr(l4, "code", 0) or 0)
+        elif ip_layer is not None and proto_num in (1, 58):
+            transport = "ICMP"  # ICMP behind unparsed extension headers
+
+        proto = classify(transport, sport, dport)
+        if transport == "OTHER" and proto_num in (50, 51):
+            proto = "VPN"  # IPsec ESP/AH
 
         return {
             "id": pid,
@@ -122,10 +160,12 @@ def summarize_packet(pkt: Packet, pid: int, ref_ips: set[str]) -> dict | None:
             "sport": sport,
             "dport": dport,
             "transport": transport,
-            "proto": classify(transport, sport, dport),
+            "proto": proto,
             "size": size,
             "flags": flags,
             "ttl": ttl,
+            "icmp_type": icmp_type,
+            "icmp_code": icmp_code,
             "dir": infer_dir(src, dst, ref_ips),
         }
     except Exception:
@@ -163,28 +203,33 @@ def get_local_ips() -> set[str]:
 
 
 def parse_pcap_bytes(data: bytes, limit: int = 50_000) -> dict:
-    """Parse a pcap/pcapng byte blob into a playback timeline.
+    """Parse a pcap/pcapng byte blob (writes to a temp file, then parses)."""
+    tmp = tempfile.NamedTemporaryFile(suffix=".pcap", delete=False)
+    try:
+        tmp.write(data)
+        tmp.close()
+        return parse_pcap_path(tmp.name, limit)
+    finally:
+        os.unlink(tmp.name)
+
+
+def parse_pcap_path(path: str, limit: int = 50_000) -> dict:
+    """Parse a pcap/pcapng file into a playback timeline.
 
     Streams via PcapReader (memory-safe), caps at `limit` packets, then infers
     the capture's vantage point (most frequent endpoint, private preferred) so
     in/out direction is meaningful even without knowing the capturing host.
     """
-    tmp = tempfile.NamedTemporaryFile(suffix=".pcap", delete=False)
-    try:
-        tmp.write(data)
-        tmp.close()
-        summaries: list[dict] = []
-        truncated = False
-        with PcapReader(tmp.name) as reader:
-            for pkt in reader:
-                if len(summaries) >= limit:
-                    truncated = True
-                    break
-                s = summarize_packet(pkt, len(summaries), set())
-                if s:
-                    summaries.append(s)
-    finally:
-        os.unlink(tmp.name)
+    summaries: list[dict] = []
+    truncated = False
+    with PcapReader(path) as reader:
+        for pkt in reader:
+            if len(summaries) >= limit:
+                truncated = True
+                break
+            s = summarize_packet(pkt, len(summaries), set())
+            if s:
+                summaries.append(s)
 
     if not summaries:
         raise ValueError("No parseable packets found in this capture.")
@@ -195,14 +240,27 @@ def parse_pcap_bytes(data: bytes, limit: int = 50_000) -> dict:
             if addr:
                 counts[addr] += 1
 
+    def is_vantage_candidate(a: str) -> bool:
+        # broadcast/multicast/link-local addresses can dominate discovery-heavy
+        # captures but can never be the capturing host
+        try:
+            ip = ipaddress.ip_address(a)
+        except ValueError:
+            return False
+        return not (
+            ip.is_multicast or ip.is_link_local or ip.is_unspecified
+            or a == "255.255.255.255"
+        )
+
     def is_private(a: str) -> bool:
         try:
             return ipaddress.ip_address(a).is_private
         except ValueError:
             return False
 
-    private = [(a, c) for a, c in counts.most_common(20) if is_private(a)]
-    vantage = private[0][0] if private else (counts.most_common(1)[0][0] if counts else None)
+    ranked = [(a, c) for a, c in counts.most_common(50) if is_vantage_candidate(a)]
+    private = [(a, c) for a, c in ranked if is_private(a)]
+    vantage = private[0][0] if private else (ranked[0][0] if ranked else None)
     ref = {vantage} if vantage else set()
     for s in summaries:
         s["dir"] = infer_dir(s["src"], s["dst"], ref)

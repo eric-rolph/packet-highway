@@ -28,12 +28,14 @@ export class LiveSource {
   }
 
   stop() {
-    if (this.ws) {
-      this.ws.onclose = null;
-      this.ws.close();
-      this.ws = null;
-      this.h.onClose();
-    }
+    const ws = this.ws;
+    if (!ws) return;
+    // detach ALL handlers: queued messages must not spawn vehicles after STOP,
+    // and closing a still-CONNECTING socket fires a spurious error event
+    ws.onmessage = ws.onerror = ws.onclose = null;
+    ws.close();
+    this.ws = null;
+    this.h.onClose();
   }
 
   get running() { return !!this.ws && this.ws.readyState <= WebSocket.OPEN; }

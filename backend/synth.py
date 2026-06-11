@@ -19,6 +19,7 @@ from .packets import classify
 
 HOME_IP = "192.168.1.50"
 HOME_MAC = "aa:bb:cc:dd:ee:01"
+NAS_MAC = "aa:bb:cc:dd:ee:02"
 GW_MAC = "aa:bb:cc:dd:ee:ff"
 
 WEB_HOSTS = [
@@ -34,21 +35,31 @@ NAS_IP = "192.168.1.20"
 RDP_HOST = "203.0.113.40"
 
 
-def _ev(ts, src, dst, sport, dport, transport, size, flags="", ttl=None):
+# LAN devices have their own MACs; external hosts arrive via the gateway's.
+_MAC_BY_IP = {HOME_IP: HOME_MAC, "192.168.1.20": NAS_MAC, "192.168.1.1": GW_MAC}
+
+
+def _make_event(ts, src, dst, sport, dport, transport, size, flags, rng, ttl_map):
     out = src == HOME_IP
+    # one TTL per host per generation run — a flow's TTL never jitters
+    if src not in ttl_map:
+        ttl_map[src] = 64 if src in _MAC_BY_IP else rng.choice((49, 52, 55, 57, 59, 61, 113, 118, 243))
+    icmp = transport == "ICMP"
     return {
         "ts": ts,
         "src": src,
         "dst": dst,
-        "smac": HOME_MAC if out else GW_MAC,
-        "dmac": GW_MAC if out else HOME_MAC,
+        "smac": _MAC_BY_IP.get(src, GW_MAC),
+        "dmac": _MAC_BY_IP.get(dst, GW_MAC),
         "sport": sport,
         "dport": dport,
         "transport": transport,
         "proto": classify(transport, sport, dport),
         "size": size,
         "flags": flags,
-        "ttl": ttl if ttl is not None else (64 if out else random.randint(48, 120)),
+        "ttl": ttl_map[src],
+        "icmp_type": (8 if out else 0) if icmp else None,
+        "icmp_code": 0 if icmp else None,
         "dir": "out" if out else "in",
     }
 
@@ -56,6 +67,10 @@ def _ev(ts, src, dst, sport, dport, transport, size, flags="", ttl=None):
 def gen_events(t0: float, duration: float, rng: random.Random) -> list[dict]:
     """Generate a sorted burst of correlated traffic events in [t0, t0+duration]."""
     ev: list[dict] = []
+    ttl_map: dict[str, int] = {}
+
+    def _ev(ts, src, dst, sport, dport, transport, size, flags=""):
+        return _make_event(ts, src, dst, sport, dport, transport, size, flags, rng, ttl_map)
 
     def web_session(t: float):
         srv = rng.choice(WEB_HOSTS)
@@ -81,11 +96,14 @@ def gen_events(t0: float, duration: float, rng: random.Random) -> list[dict]:
             ev.append(_ev(tr, srv, HOME_IP, port, cport, "TCP", rng.randint(620, 1514), "PA"))
             if rng.random() < 0.5:
                 ev.append(_ev(tr + 0.004, HOME_IP, srv, cport, port, "TCP", 60, "A"))
-        # Teardown
-        if rng.random() < 0.6:
-            ev.append(_ev(tr + rng.uniform(0.05, 0.4), HOME_IP, srv, cport, port, "TCP", 60, "FA"))
-            ev.append(_ev(tr + rng.uniform(0.45, 0.6), srv, HOME_IP, port, cport, "TCP", 60, "FA"))
-        elif rng.random() < 0.3:
+        # Teardown: 60% clean FIN exchange, 30% RST, 10% left open
+        r = rng.random()
+        if r < 0.6:
+            tf = tr + rng.uniform(0.05, 0.4)
+            ev.append(_ev(tf, HOME_IP, srv, cport, port, "TCP", 60, "FA"))
+            ev.append(_ev(tf + rtt, srv, HOME_IP, port, cport, "TCP", 60, "FA"))
+            ev.append(_ev(tf + rtt * 1.4, HOME_IP, srv, cport, port, "TCP", 60, "A"))
+        elif r < 0.9:
             ev.append(_ev(tr + rng.uniform(0.05, 0.2), srv, HOME_IP, port, cport, "TCP", 60, "R"))
 
     def dns_only(t: float):
@@ -232,15 +250,16 @@ class DemoStream:
 
 
 _sample_lock = threading.Lock()
-_sample_bytes: bytes | None = None
+_sample_cache: dict[tuple[float, int], bytes] = {}
 
 
 def build_sample_pcap_bytes(duration: float = 90.0, seed: int = 7) -> bytes:
-    """Render the synthetic model into a genuine pcap file (cached)."""
-    global _sample_bytes
+    """Render the synthetic model into a genuine pcap file (cached per args)."""
+    key = (duration, seed)
     with _sample_lock:
-        if _sample_bytes is not None:
-            return _sample_bytes
+        cached = _sample_cache.get(key)
+        if cached is not None:
+            return cached
 
         from scapy.layers.inet import ICMP, IP, TCP, UDP
         from scapy.layers.l2 import Ether
@@ -272,7 +291,7 @@ def build_sample_pcap_bytes(duration: float = 90.0, seed: int = 7) -> bytes:
             tmp.close()
             wrpcap(tmp.name, pkts)
             with open(tmp.name, "rb") as f:
-                _sample_bytes = f.read()
+                _sample_cache[key] = f.read()
         finally:
             os.unlink(tmp.name)
-        return _sample_bytes
+        return _sample_cache[key]

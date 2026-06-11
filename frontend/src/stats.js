@@ -1,6 +1,9 @@
 // Rolling-window statistics engine. Mode-agnostic: "now" is wall-clock time
-// in live mode and the playback clock in PCAP mode, so the dashboard shows
-// the truth for whichever timeline is driving the scene.
+// in live mode and the playback clock in PCAP mode.
+//
+// Aggregates into per-second buckets at add() time, so snapshot cost depends
+// on the window length (≤60 buckets), not the packet rate — at thousands of
+// packets/sec the old per-event array melted the frame budget.
 
 export class StatsEngine {
   constructor(windowSec = 60) {
@@ -9,50 +12,70 @@ export class StatsEngine {
   }
 
   reset() {
-    this.events = [];        // {t, bytes, proto, src, dir} sorted by arrival
+    this.buckets = new Map(); // epoch-second -> bucket
     this.totalPkts = 0;
     this.totalBytes = 0;
   }
 
   add(p) {
-    this.events.push({ t: p.ts, bytes: p.size, proto: p.proto, src: p.src, dir: p.dir });
+    const sec = Math.floor(p.ts);
+    let b = this.buckets.get(sec);
+    if (!b) {
+      b = { pkts: 0, bytes: 0, bytesIn: 0, bytesOut: 0, protos: new Map(), talkers: new Map() };
+      this.buckets.set(sec, b);
+    }
+    b.pkts++;
+    b.bytes += p.size;
+    if (p.dir === 'in') b.bytesIn += p.size; else b.bytesOut += p.size;
+    const pr = b.protos.get(p.proto) ?? { pkts: 0, bytes: 0 };
+    pr.pkts++; pr.bytes += p.size;
+    b.protos.set(p.proto, pr);
+    for (const ip of [p.src, p.dst]) { // both endpoints: flooded receivers chart too
+      if (!ip) continue;
+      const tk = b.talkers.get(ip) ?? { bytes: 0, pkts: 0 };
+      tk.bytes += p.size; tk.pkts++;
+      b.talkers.set(ip, tk);
+    }
     this.totalPkts++;
     this.totalBytes += p.size;
   }
 
   prune(now) {
-    const cutoff = now - this.windowSec;
-    let n = 0;
-    while (n < this.events.length && this.events[n].t < cutoff) n++;
-    if (n > 0) this.events.splice(0, n);
+    const cutoff = Math.floor(now) - this.windowSec - 2;
+    for (const sec of this.buckets.keys()) {
+      if (sec < cutoff) this.buckets.delete(sec);
+    }
   }
 
   snapshot(now) {
     this.prune(now);
-    let bwIn = 0, bwOut = 0, pps = 0;
+    const nowSec = Math.floor(now);
+    let bwIn = 0, bwOut = 0, pps = 0, winPkts = 0;
     const protos = new Map();
     const talkers = new Map();
-    const buckets = new Float64Array(this.windowSec); // bytes per second, index 0 = oldest
+    const series = new Float64Array(this.windowSec); // bytes/sec, oldest first
 
-    for (const e of this.events) {
-      const age = now - e.t;
-      if (age <= 2.0) { // bandwidth over the last 2 s
-        if (e.dir === 'in') bwIn += e.bytes; else bwOut += e.bytes;
+    for (const [sec, b] of this.buckets) {
+      const age = nowSec - sec;
+      if (age < 0 || age >= this.windowSec) continue;
+      series[this.windowSec - 1 - age] += b.bytes;
+      winPkts += b.pkts;
+      if (age <= 1) { bwIn += b.bytesIn; bwOut += b.bytesOut; }
+      if (age === 1) pps = b.pkts; // last COMPLETED second
+      for (const [proto, v] of b.protos) {
+        const agg = protos.get(proto) ?? { pkts: 0, bytes: 0 };
+        agg.pkts += v.pkts; agg.bytes += v.bytes;
+        protos.set(proto, agg);
       }
-      if (age <= 1.0) pps++;
-      const pr = protos.get(e.proto) ?? { pkts: 0, bytes: 0 };
-      pr.pkts++; pr.bytes += e.bytes;
-      protos.set(e.proto, pr);
-      if (e.src) {
-        const tk = talkers.get(e.src) ?? { bytes: 0, pkts: 0 };
-        tk.bytes += e.bytes; tk.pkts++;
-        talkers.set(e.src, tk);
+      for (const [ip, v] of b.talkers) {
+        const agg = talkers.get(ip) ?? { bytes: 0, pkts: 0 };
+        agg.bytes += v.bytes; agg.pkts += v.pkts;
+        talkers.set(ip, agg);
       }
-      const b = this.windowSec - 1 - Math.floor(age);
-      if (b >= 0 && b < this.windowSec) buckets[b] += e.bytes;
     }
+    if (pps === 0) pps = this.buckets.get(nowSec)?.pkts ?? 0; // first second of a stream
 
-    const totalWinPkts = this.events.length || 1;
+    const totalWinPkts = winPkts || 1;
     return {
       bpsIn: (bwIn / 2) * 8,
       bpsOut: (bwOut / 2) * 8,
@@ -66,7 +89,7 @@ export class StatsEngine {
         .map(([ip, v]) => ({ ip, ...v }))
         .sort((a, b) => b.bytes - a.bytes)
         .slice(0, 5),
-      buckets,
+      buckets: series,
     };
   }
 }

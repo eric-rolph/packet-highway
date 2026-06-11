@@ -89,7 +89,9 @@
         <span>FPS <b id="hud-fps" class="text-slate-100">—</b></span>
         <span>VEHICLES <b id="hud-active" class="text-slate-100">0</b></span>
         <span>PKT/S <b id="hud-pps" class="text-slate-100">0</b></span>
-        <span title="packets merged into convoys to keep lanes readable">MERGED <b id="hud-merged" class="text-slate-100">0</b></span>
+        <span title="packets merged into convoys (intentional aggregation)">MERGED <b id="hud-merged" class="text-slate-100">0</b></span>
+        <span title="vehicle visuals reclaimed early under pool pressure">RECYCLED <b id="hud-recycled" class="text-slate-100">0</b></span>
+        <span title="packets dropped server-side under backlog — red means the view is incomplete">DROPPED <b id="hud-dropped" class="text-slate-100">0</b></span>
       </div>
     </header>
 
@@ -128,7 +130,9 @@
             <div class="flex justify-between"><span class="text-slate-400">⏳ pending</span><b id="tcph-pending" class="text-slate-200">0</b></div>
             <div class="flex justify-between"><span class="text-slate-400">⚠ half-open</span><b id="tcph-half" class="text-amber-400">0</b></div>
             <div class="flex justify-between"><span class="text-slate-400">⛔ refused</span><b id="tcph-refused" class="text-red-400">0</b></div>
-            <div class="flex justify-between col-span-2"><span class="text-slate-400">RST seen</span><b id="tcph-rst" class="text-red-300">0</b></div>
+            <div class="flex justify-between"><span class="text-slate-400">RST seen</span><b id="tcph-rst" class="text-red-300">0</b></div>
+            <div class="flex justify-between"><span class="text-slate-400">SYN retries</span><b id="tcph-retries" class="text-amber-300">0</b></div>
+            <div class="flex justify-between col-span-2"><span class="text-slate-400" title="passive handshake RTT (SYN→SYN-ACK), median / 95th percentile">RTT med · p95</span><b id="tcph-rtt" class="text-cyan-300">—</b></div>
           </div>
           <div class="h-1.5 bg-slate-800 rounded-full overflow-hidden mt-2" title="handshake success ratio">
             <div id="tcph-bar" class="h-full rounded-full bg-emerald-500" style="width:100%"></div>

@@ -22,6 +22,23 @@ export function fmtTime(ts) {
   return `${d.toLocaleTimeString([], { hour12: false })}.${ms}`;
 }
 
+const ICMP_NAMES_V4 = {
+  0: 'echo reply', 3: 'destination unreachable', 5: 'redirect',
+  8: 'echo request', 11: 'time exceeded (TTL)', 12: 'parameter problem',
+};
+const ICMP_NAMES_V6 = {
+  1: 'destination unreachable', 2: 'packet too big', 3: 'time exceeded',
+  4: 'parameter problem', 128: 'echo request', 129: 'echo reply',
+  133: 'router solicitation', 134: 'router advertisement',
+  135: 'neighbor solicitation', 136: 'neighbor advertisement',
+};
+
+function icmpName(p) {
+  const v6 = !!p.src && p.src.includes(':');
+  const name = (v6 ? ICMP_NAMES_V6 : ICMP_NAMES_V4)[p.icmp_type];
+  return `type ${p.icmp_type}/${p.icmp_code ?? 0}${name ? ` — ${name}` : ''}`;
+}
+
 export class UI {
   constructor(callbacks) {
     this.cb = callbacks;
@@ -30,8 +47,10 @@ export class UI {
       'tab-live', 'tab-pcap', 'live-controls', 'pcap-controls', 'iface-select',
       'bpf-input', 'btn-capture', 'file-input', 'btn-sample', 'pcap-meta',
       'stat-bw-in', 'stat-bw-out', 'stat-total', 'spark-canvas', 'proto-list',
-      'talkers-list', 'legend-list', 'hud-fps', 'hud-active', 'hud-pps', 'hud-merged',
-      'tcph-est', 'tcph-pending', 'tcph-half', 'tcph-refused', 'tcph-rst', 'tcph-bar',
+      'talkers-list', 'legend-list', 'hud-fps', 'hud-active', 'hud-pps',
+      'hud-merged', 'hud-recycled', 'hud-dropped',
+      'tcph-est', 'tcph-pending', 'tcph-half', 'tcph-refused', 'tcph-rst',
+      'tcph-retries', 'tcph-rtt', 'tcph-bar',
       'detail-panel', 'detail-body', 'detail-close', 'playback-bar', 'btn-play',
       'sel-speed', 'time-cur', 'time-total', 'time-abs', 'scrub', 'hist-canvas',
       'toasts',
@@ -57,6 +76,7 @@ export class UI {
     const scrub = this.el['scrub'];
     scrub.addEventListener('pointerdown', () => { this.scrubbing = true; });
     scrub.addEventListener('pointerup', () => { this.scrubbing = false; });
+    scrub.addEventListener('pointercancel', () => { this.scrubbing = false; });
     scrub.addEventListener('input', () => this.cb.onScrub(scrub.value / 1000));
 
     document.addEventListener('keydown', (e) => {
@@ -79,8 +99,9 @@ export class UI {
         <span class="text-red-300">RST</span></div>
       <div class="text-slate-400">🔦 Shoulder flares = failed handshakes:
         <span class="text-amber-300">no answer</span> ·
-        <span class="text-red-300">refused</span> (click them)</div>
-      <div class="text-slate-500 mt-1">right side → inbound · left side → outbound · road-train = burst of packets</div>`);
+        <span class="text-red-300">refused</span> — they stack per target (click them)</div>
+      <div class="text-slate-500 mt-1">right side → inbound · left side → outbound · road-train = burst of packets</div>
+      <div class="text-slate-500">⏱ same-lane spacing = real inter-arrival timing · click a vehicle to spotlight its flow</div>`);
     this.el['legend-list'].innerHTML = rows.join('');
   }
 
@@ -122,10 +143,19 @@ export class UI {
 
   updatePlayback(pb) {
     if (!pb.loaded) return;
+    // called every frame — skip everything when nothing changed (paused),
+    // and cache the Intl-formatted date per second (toLocale* is costly)
+    if (this._lastT === pb.t && !this.scrubbing) return;
+    this._lastT = pb.t;
     this.el['btn-play'].textContent = pb.playing ? '❚❚' : '▶';
     this.el['time-cur'].textContent = fmtDur(pb.t - pb.meta.start);
     this.el['time-total'].textContent = fmtDur(pb.meta.duration);
-    this.el['time-abs'].textContent = `${new Date(pb.t * 1000).toLocaleDateString()} ${fmtTime(pb.t)}`;
+    const sec = Math.floor(pb.t);
+    if (this._dateSec !== sec) {
+      this._dateSec = sec;
+      this._dateStr = new Date(sec * 1000).toLocaleDateString();
+    }
+    this.el['time-abs'].textContent = `${this._dateStr} ${fmtTime(pb.t)}`;
     if (!this.scrubbing) this.el['scrub'].value = Math.round(pb.progress * 1000);
     drawHistogram(this.el['hist-canvas'], this.histBuckets, pb.progress);
   }
@@ -163,6 +193,10 @@ export class UI {
       this.el['tcph-half'].textContent = c.halfOpen.toLocaleString();
       this.el['tcph-refused'].textContent = c.refused.toLocaleString();
       this.el['tcph-rst'].textContent = c.resets.toLocaleString();
+      this.el['tcph-retries'].textContent = c.synRetries.toLocaleString();
+      this.el['tcph-rtt'].textContent = flow.rtt
+        ? `${flow.rtt.med.toFixed(0)} / ${flow.rtt.p95.toFixed(0)} ms`
+        : '—';
       const attempts = c.established + c.halfOpen + c.refused;
       const okFrac = attempts ? c.established / attempts : 1;
       this.el['tcph-bar'].style.width = `${(okFrac * 100).toFixed(1)}%`;
@@ -170,12 +204,16 @@ export class UI {
     }
   }
 
-  hud({ fps, active, pps, merged }) {
+  hud({ fps, active, pps, merged, recycled, dropped }) {
     this.el['hud-fps'].textContent = fps.toFixed(0);
     this.el['hud-fps'].className = fps >= 55 ? 'text-emerald-400' : fps >= 30 ? 'text-amber-400' : 'text-red-400';
     this.el['hud-active'].textContent = active.toLocaleString();
     this.el['hud-pps'].textContent = pps.toLocaleString();
     this.el['hud-merged'].textContent = merged.toLocaleString();
+    this.el['hud-recycled'].textContent = recycled.toLocaleString();
+    const drop = this.el['hud-dropped'];
+    drop.textContent = dropped.toLocaleString();
+    drop.className = dropped > 0 ? 'text-red-400 font-bold' : 'text-slate-100';
   }
 
   showDetail(meta) {
@@ -214,15 +252,16 @@ export class UI {
         <span class="badge bg-slate-700/60 text-slate-300">${esc(p.transport)}</span>
       </div>
       ${this.row('Timestamp', esc(fmtTime(p.ts)))}
-      ${this.row('Epoch', p.ts.toFixed(6))}
-      ${this.row('Source IP', `${esc(p.src)}${p.sport ? ':' + p.sport : ''}`)}
-      ${this.row('Dest IP', `${esc(p.dst)}${p.dport ? ':' + p.dport : ''}`)}
+      ${this.row('Epoch', esc(p.ts.toFixed(6)))}
+      ${this.row('Source IP', `${esc(p.src)}${p.sport != null ? ':' + esc(p.sport) : ''}`)}
+      ${this.row('Dest IP', `${esc(p.dst)}${p.dport != null ? ':' + esc(p.dport) : ''}`)}
       ${this.row('Source MAC', esc(p.smac))}
       ${this.row('Dest MAC', esc(p.dmac))}
-      ${this.row('Size', `${p.size.toLocaleString()} bytes`)}
-      ${this.row('TTL', p.ttl ?? '—')}
+      ${this.row('Size', `${esc(p.size.toLocaleString())} bytes`)}
+      ${this.row('TTL', esc(p.ttl ?? '—'))}
       ${this.row('TCP flags', esc(flagStr))}
-      ${this.row('Packet #', '#' + p.id)}
+      ${p.icmp_type != null ? this.row('ICMP', esc(icmpName(p))) : ''}
+      ${this.row('Packet #', esc('#' + p.id))}
     `;
   }
 
@@ -263,13 +302,14 @@ export class UI {
     return `
       <div class="flex items-center gap-2 mb-2 flex-wrap">${title} ${this.dirBadge(p.dir)}</div>
       <p class="text-slate-400 mb-2">${hint}</p>
-      ${this.row('SYN sent', esc(fmtTime(p.ts)))}
-      ${this.row('Client', `${esc(p.src)}:${p.sport}`)}
-      ${this.row('Target', `${esc(p.dst)}:${p.dport}`)}
+      ${m.attempts > 1 ? this.row('Failed attempts', esc(`×${m.attempts} against this target`)) : ''}
+      ${this.row('Last SYN', esc(fmtTime(p.ts)))}
+      ${this.row('Client', `${esc(p.src)}:${esc(p.sport)}`)}
+      ${this.row('Target', `${esc(p.dst)}:${esc(p.dport)}`)}
       ${m.rst ? this.row('RST received', esc(fmtTime(m.rst.ts))) : ''}
-      ${m.rst ? this.row('Refused after', `${((m.rst.ts - p.ts) * 1000).toFixed(1)} ms`) : ''}
+      ${m.rst ? this.row('Refused after', esc(`${((m.rst.ts - p.ts) * 1000).toFixed(1)} ms`)) : ''}
       ${this.row('Source MAC', esc(p.smac))}
-      ${this.row('TTL', p.ttl ?? '—')}
+      ${this.row('TTL', esc(p.ttl ?? '—'))}
     `;
   }
 

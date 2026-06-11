@@ -2,6 +2,7 @@
 // sources, and UI, and runs the render loop. Two sources can drive the road:
 //   LIVE  — WebSocket stream of capture (or demo) packets, wall-clock time
 //   PCAP  — uploaded capture replayed through the Playback engine's clock
+import { flowKeyOf } from './config.js';
 import { createScene } from './scene.js';
 import { buildHighway } from './highway.js';
 import { TrafficController } from './traffic.js';
@@ -39,6 +40,7 @@ function resetWorld() {
   traffic.clear();
   stats.reset();
   flows.reset();
+  liveDropped = 0;
   picker.deselect();
 }
 
@@ -109,7 +111,12 @@ const ui = new UI({
   onDetailClose() { picker.deselect(); },
 });
 
-const picker = new Picker(canvas, camera, traffic, (meta) => ui.showDetail(meta));
+const picker = new Picker(canvas, camera, traffic, (meta) => {
+  ui.showDetail(meta);
+  // spotlight the clicked packet's conversation (flares spotlight their SYN's)
+  const flowPkt = meta?.flowEvent ? meta.syn : meta;
+  traffic.setHighlight(flowPkt && !flowPkt.aggregate ? flowKeyOf(flowPkt) : null);
+});
 scene.add(picker.ring);
 
 function seekTo(frac) {
@@ -175,12 +182,18 @@ function step(now, render) {
     const statsNow = mode === 'pcap' ? (playback.loaded ? playback.t : 0) : Date.now() / 1000;
     for (const ev of flows.tick(statsNow)) traffic.spawnFlare(ev);
     const snap = stats.snapshot(statsNow);
-    ui.renderStats(snap, { counts: flows.counts, pending: flows.pendingCount });
+    ui.renderStats(snap, {
+      counts: flows.counts,
+      pending: flows.pendingCount,
+      rtt: flows.rttStats,
+    });
     ui.hud({
       fps,
       active: traffic.activeCount(),
       pps: snap.pps,
-      merged: traffic.aggregatedPkts + traffic.recycled + liveDropped,
+      merged: traffic.aggregatedPkts, // packets riding in convoys (by design)
+      recycled: traffic.recycled,     // visuals reclaimed early (pool pressure)
+      dropped: liveDropped,           // server-side losses (red = data missing)
     });
   }
 }

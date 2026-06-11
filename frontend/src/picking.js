@@ -19,10 +19,16 @@ export class Picker {
     this.ring.rotation.x = Math.PI / 2;
     this.ring.visible = false;
 
-    let downX = 0, downY = 0;
-    canvas.addEventListener('pointerdown', (e) => { downX = e.clientX; downY = e.clientY; });
+    let downX = NaN, downY = NaN;
+    canvas.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0) return;
+      downX = e.clientX; downY = e.clientY;
+    });
     canvas.addEventListener('pointerup', (e) => {
-      if (Math.hypot(e.clientX - downX, e.clientY - downY) > 6) return; // it was an orbit drag
+      if (e.button !== 0 || Number.isNaN(downX)) return;
+      const moved = Math.hypot(e.clientX - downX, e.clientY - downY);
+      downX = downY = NaN;
+      if (moved > 6) return; // it was an orbit drag
       this.pick(e.clientX, e.clientY);
     });
   }
@@ -36,7 +42,7 @@ export class Picker {
       if (!pool || hit.instanceId === undefined) continue;
       const rec = pool.active.get(hit.instanceId);
       if (!rec) continue;
-      this.selected = { pool, idx: hit.instanceId };
+      this.selected = { pool, idx: hit.instanceId, rec };
       this.ring.visible = true;
       this.onSelect(rec.meta);
       return;
@@ -54,7 +60,13 @@ export class Picker {
   update(t) {
     if (!this.selected) return;
     const rec = this.selected.pool.active.get(this.selected.idx);
-    if (!rec) { this.selected = null; this.ring.visible = false; return; }
+    // identity check: a pool steal can reuse this idx for a NEW vehicle —
+    // don't glue the ring to a stranger
+    if (!rec || rec !== this.selected.rec) {
+      this.selected = null;
+      this.ring.visible = false;
+      return;
+    }
     const y = this.selected.pool.type === 'drone' ? rec.yBase : rec.yBase + 0.25;
     this.ring.position.set(rec.x, y, rec.z);
     const s = 1 + 0.12 * Math.sin(t * 5);

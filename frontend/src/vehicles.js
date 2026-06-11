@@ -142,7 +142,6 @@ export class VehiclePool {
     const spec = TYPE_SPECS[type];
     this.type = type;
     this.cap = spec.cap;
-    this.baseSpeed = spec.speed;
     this.hasBeacon = type === 'police' || type === 'signal';
 
     const mat = new THREE.MeshStandardMaterial({ vertexColors: true, metalness: 0.2, roughness: 0.55 });
@@ -178,7 +177,9 @@ export class VehiclePool {
     this.recycled = 0;
   }
 
-  /** opts: {x, dirSign, color, scaleL, len, yBase, meta, beaconColor} */
+  /** opts: {x, speed, dirSign, color, scaleL, len, yBase, meta, beaconColor}
+   *  speed is EXACT (lane speed) — same-lane vehicles must never differ,
+   *  which is what makes collisions geometrically impossible. */
   spawn(opts) {
     let idx = this.free.pop();
     if (idx === undefined) {
@@ -187,21 +188,18 @@ export class VehiclePool {
       idx = this.free.pop();
       this.recycled++;
     }
-    const speed = this.baseSpeed * (0.9 + Math.random() * 0.2);
     const rec = {
       idx,
       x: opts.x,
-      targetX: opts.x,
       dirSign: opts.dirSign,
-      z: opts.z ?? -opts.dirSign * (HALF_LEN + 4),
-      speed,            // own preferred speed
-      curSpeed: speed,  // clamped by the follow model each frame
+      z: -opts.dirSign * (HALF_LEN + 4),
+      speed: opts.speed,
       scaleL: opts.scaleL ?? 1,
       len: (opts.len ?? 4) * (opts.scaleL ?? 1),
       yBase: opts.yBase ?? 0,
       bobPhase: Math.random() * Math.PI * 2,
-      changeCd: 0,
       gone: false,
+      baseColor: opts.color,
       meta: opts.meta,
     };
     this.active.set(idx, rec);
@@ -224,13 +222,19 @@ export class VehiclePool {
     this.free.push(idx);
   }
 
+  /** Re-apply an instance's display color (flow highlighting). */
+  tint(idx, colorInt) {
+    this.mesh.setColorAt(idx, _color.set(colorInt));
+    this.mesh.instanceColor.needsUpdate = true;
+  }
+
   update(dt, t) {
     const done = [];
     const droneY = this.type === 'drone';
     for (const rec of this.active.values()) {
-      rec.z += rec.dirSign * rec.curSpeed * dt;
-      rec.x += (rec.targetX - rec.x) * Math.min(1, dt * 5); // lane-change glide
-      if (Math.abs(rec.z) > HALF_LEN + 16) { done.push(rec.idx); continue; }
+      rec.z += rec.dirSign * rec.speed * dt;
+      // cull only past the EXIT gate (z grows toward travel direction)
+      if (rec.z * rec.dirSign > HALF_LEN + 16) { done.push(rec.idx); continue; }
       const y = droneY ? rec.yBase + Math.sin(t * 3 + rec.bobPhase) * 0.45 : 0;
       _dummy.position.set(rec.x, y, rec.z);
       _dummy.rotation.set(0, rec.dirSign > 0 ? 0 : Math.PI, 0);
@@ -286,23 +290,48 @@ export class FlarePool {
     this.free = [];
     for (let i = cap - 1; i >= 0; i--) this.free.push(i);
     this.active = new Map();
+    this.byKey = new Map(); // target key -> rec (failures stack per target)
     this.ttl = 9; // seconds a flare stays on the shoulder
   }
 
-  spawn({ x, z, color, meta }) {
+  /** Repeated failures against the same target GROW one flare (a dead
+   *  service = one tall stack; a port scan = a strip of stacks) instead of
+   *  sprinkling indistinguishable blinks at random positions. */
+  spawn({ x, z, color, meta, key }) {
+    if (key) {
+      const existing = this.byKey.get(key);
+      if (existing && this.active.has(existing.idx)) {
+        const m = existing.meta;
+        m.attempts = (m.attempts ?? 1) + 1;
+        if (meta.rst) m.rst = meta.rst;
+        m.flowEvent = meta.flowEvent;
+        m.syn = meta.syn;
+        existing.refresh = true;
+        existing.boost = Math.min(1 + Math.log2(m.attempts) * 0.35, 2.4);
+        this.mesh.setColorAt(existing.idx, _color.set(color));
+        this.mesh.instanceColor.needsUpdate = true;
+        return;
+      }
+    }
     let idx = this.free.pop();
     if (idx === undefined) {
       const oldest = this.active.keys().next().value;
       this.release(oldest);
       idx = this.free.pop();
     }
-    this.active.set(idx, { idx, x, z, yBase: 0, born: -1, meta });
+    meta.attempts = meta.attempts ?? 1;
+    const rec = { idx, x, z, yBase: 0, born: -1, boost: 1, refresh: false, key, meta };
+    this.active.set(idx, rec);
+    if (key) this.byKey.set(key, rec);
     this.mesh.setColorAt(idx, _color.set(color));
     this.mesh.instanceColor.needsUpdate = true;
   }
 
   release(idx) {
-    if (!this.active.delete(idx)) return;
+    const rec = this.active.get(idx);
+    if (!rec) return;
+    this.active.delete(idx);
+    if (rec.key && this.byKey.get(rec.key) === rec) this.byKey.delete(rec.key);
     this.mesh.setMatrixAt(idx, parkMatrix());
     this.free.push(idx);
   }
@@ -310,14 +339,14 @@ export class FlarePool {
   update(dt, t) {
     const done = [];
     for (const rec of this.active.values()) {
-      if (rec.born < 0) rec.born = t;
+      if (rec.born < 0 || rec.refresh) { rec.born = t; rec.refresh = false; }
       const age = t - rec.born;
       if (age > this.ttl) { done.push(rec.idx); continue; }
       const fade = age > this.ttl - 2 ? (this.ttl - age) / 2 : 1;
-      const pulse = 1 + 0.15 * Math.sin(t * 6 + rec.idx);
+      const pulse = (1 + 0.15 * Math.sin(t * 6 + rec.idx)) * rec.boost;
       _dummy.position.set(rec.x, 0, rec.z);
       _dummy.rotation.set(0, 0, 0);
-      _dummy.scale.set(pulse * fade, fade, pulse * fade);
+      _dummy.scale.set(pulse * fade, fade * rec.boost, pulse * fade);
       _dummy.updateMatrix();
       this.mesh.setMatrixAt(rec.idx, _dummy.matrix);
     }

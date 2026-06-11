@@ -1,9 +1,17 @@
-// Shared constants: protocol taxonomy, lane layout, vehicle types, colors.
+// Shared constants: protocol taxonomy, lanes, colors, vehicle types.
 // The legend is GENERATED from this file (see LEGEND below), so swatches in
 // the UI always match what's rendered on the road.
+//
+// TIMING MODEL: every vehicle in a lane moves at the SAME constant speed
+// (the lane's speed below). Position is therefore an exact linear function
+// of arrival time — the road is a scrolling timeline, and the spacing
+// between same-lane vehicles IS their real inter-arrival spacing. Because
+// speeds never differ within a lane, overtaking (and therefore collision/
+// ghosting) is geometrically impossible. Near-simultaneous arrivals take
+// the parallel sub-lane; bursts beyond both sub-lanes become convoys.
 
 export const PROTO_COLORS = {
-  HTTPS:  0x10b981, // emerald — encrypted web
+  HTTPS:  0x10b981, // emerald — encrypted web (incl. QUIC)
   HTTP:   0xf97316, // orange  — cleartext web (deliberately "warning" colored)
   DNS:    0xfacc15, // yellow
   ICMP:   0xf1f5f9, // white   — police cars
@@ -30,15 +38,17 @@ export const PROTO_CSS = Object.fromEntries(
 // Strobe colors for TCP control (signal cars)
 export const FLAG_COLORS = { S: 0xfbbf24, SA: 0x4ade80, F: 0xc084fc, FA: 0xc084fc, R: 0xf87171, RA: 0xf87171 };
 
+// Lane speed = world units/sec for EVERY vehicle in that lane (see header).
 export const LANES = [
-  { key: 'WEB',   label: 'WEB · 80/443' },
-  { key: 'DNS',   label: 'DNS · 53' },
-  { key: 'MGMT',  label: 'MGMT · 22/3389' },
-  { key: 'INFRA', label: 'INFRA · SNMP/NTP' },
-  { key: 'FILE',  label: 'FILE · 445/21' },
-  { key: 'OTHER', label: 'OTHER' },
-  { key: 'ICMP',  label: 'ICMP' },
+  { key: 'WEB',   label: 'WEB · 80/443',       speed: 46 },
+  { key: 'DNS',   label: 'DNS · 53',           speed: 92 },
+  { key: 'MGMT',  label: 'MGMT · 22/3389',     speed: 62 },
+  { key: 'INFRA', label: 'INFRA · SNMP/NTP',   speed: 52 },
+  { key: 'FILE',  label: 'FILE · 445/21',      speed: 46 },
+  { key: 'OTHER', label: 'OTHER',              speed: 58 },
+  { key: 'ICMP',  label: 'ICMP',               speed: 70 },
 ];
+export const LANE_SPEED = Object.fromEntries(LANES.map((l) => [l.key, l.speed]));
 
 const PROTO_LANE = {
   HTTP: 'WEB', HTTPS: 'WEB',
@@ -51,15 +61,13 @@ const PROTO_LANE = {
 
 export const HIGHWAY = {
   length: 620,
-  laneWidth: 8.4,   // wide enough for two sub-lanes (cruise + passing)
+  laneWidth: 8.4,   // wide enough for two sub-lanes
   medianWidth: 11,
   shoulder: 8,
 };
 export const HALF_LEN = HIGHWAY.length / 2;
 
-// Each protocol lane is split into two sub-lanes so faster vehicles can
-// overtake instead of ghosting through slower ones: sub 0 = passing (inner,
-// nearer the median), sub 1 = cruise (outer).
+// Two sub-lanes per protocol lane absorb near-simultaneous arrivals.
 export const SUBLANE_OFFSET = 2.1;
 
 export function laneOffset(i) {
@@ -77,20 +85,31 @@ export function laneFor(p) {
   return PROTO_LANE[p.proto] ?? 'OTHER';
 }
 
-const CONTROL_FLAGS = new Set(['S', 'SA', 'F', 'FA', 'R', 'RA']);
+/** TCP control packets (handshake/teardown) — flag MEMBERSHIP, not equality,
+ *  so ECN-marked handshakes ("SEC"/"SAE") classify correctly. */
 export function isControl(p) {
-  return p.transport === 'TCP' && CONTROL_FLAGS.has(p.flags) && p.size <= 120;
+  if (p.transport !== 'TCP' || !p.flags || p.size > 120) return false;
+  return p.flags.includes('S') || p.flags.includes('F') || p.flags.includes('R');
+}
+
+/** Canonical flow key for a packet (order-independent 4-tuple), or null. */
+export function flowKeyOf(p) {
+  if (!p || p.sport == null || p.dport == null) return null;
+  const a = `${p.src}:${p.sport}`;
+  const b = `${p.dst}:${p.dport}`;
+  return a < b ? `${a}|${b}` : `${b}|${a}`;
 }
 
 // Vehicle metaphors:
 //   motorcycle — DNS: small queries weaving through fast
 //   van/truck  — payload carriers (web, file transfer), length scales w/ bytes
 //   sedan      — generic / interactive TCP (SSH, RDP)
-//   police     — ICMP: the network's patrol & diagnostics (red/blue strobes)
+//   police     — ICMP: the network's patrol & diagnostics (red/blue strobes;
+//                error messages like unreachable/TTL-exceeded ride red-bodied)
 //   signal     — TCP control packets (SYN/SYN-ACK/FIN/RST), flag-colored strobe
-//   drone      — UDP: connectionless, never touches the road surface
+//   drone      — UDP: connectionless, never touches the road
 //   cart       — L2 housekeeping (ARP etc.): slow maintenance vehicle
-//   convoy     — aggregate of a traffic burst (N packets as one long hauler)
+//   convoy     — aggregate of a traffic burst (N packets as one road-train)
 const VAN_PROTOS = new Set(['SMB', 'FTP', 'VPN', 'MAIL']);
 export function vehicleTypeFor(p) {
   if (isControl(p)) return 'signal';
@@ -103,26 +122,18 @@ export function vehicleTypeFor(p) {
   return 'cart';
 }
 
-// speed = world units/sec, cap = instance pool size,
-// len = visual length at scale 1 (used for follow-gap math)
+// cap = instance pool size, len = visual length at scale 1 (for spacing math)
 export const TYPE_SPECS = {
-  motorcycle: { speed: 95, cap: 280, len: 3.2 },
-  van:        { speed: 55, cap: 260, len: 5.6 },
-  truck:      { speed: 40, cap: 160, len: 8.6 },
-  sedan:      { speed: 62, cap: 320, len: 5.0 },
-  police:     { speed: 70, cap: 140, len: 5.0 },
-  signal:     { speed: 75, cap: 220, len: 3.8 },
-  drone:      { speed: 48, cap: 200, len: 2.4 },
-  cart:       { speed: 38, cap: 140, len: 3.2 },
-  convoy:     { speed: 45, cap: 120, len: 11.0 },
+  motorcycle: { cap: 280, len: 3.2 },
+  van:        { cap: 260, len: 5.6 },
+  truck:      { cap: 160, len: 8.6 },
+  sedan:      { cap: 320, len: 5.0 },
+  police:     { cap: 140, len: 5.0 },
+  signal:     { cap: 220, len: 3.8 },
+  drone:      { cap: 200, len: 2.4 },
+  cart:       { cap: 140, len: 3.2 },
+  convoy:     { cap: 120, len: 11.0 },
 };
-
-// Vehicles at or above this base speed prefer the passing sub-lane.
-export const PASS_SPEED = 60;
-
-// Minimum time between vehicles entering the same lane (prevents overlap);
-// bursts beyond this are merged into convoys.
-export const HEADWAY_MS = 130;
 
 export const FLAG_NAMES = {
   F: 'FIN', S: 'SYN', R: 'RST', P: 'PSH', A: 'ACK', U: 'URG', E: 'ECE', C: 'CWR',
@@ -130,16 +141,16 @@ export const FLAG_NAMES = {
 
 // Rows for the auto-generated legend (color always = PROTO_COLORS).
 export const LEGEND = [
-  { proto: 'DNS',   text: 'DNS — motorcycles (small & fast)' },
-  { proto: 'HTTPS', text: 'HTTPS — vans/trucks · length = bytes' },
+  { proto: 'DNS',   text: 'DNS — motorcycles (fast lane)' },
+  { proto: 'HTTPS', text: 'HTTPS/QUIC — vans/trucks · length = bytes' },
   { proto: 'HTTP',  text: 'HTTP (cleartext) — vans/trucks' },
-  { proto: 'ICMP',  text: 'ICMP — police cars (red/blue strobe)' },
+  { proto: 'ICMP',  text: 'ICMP — police cars (errors ride red)' },
   { proto: 'SSH',   text: 'SSH — sedans (MGMT lane)' },
   { proto: 'RDP',   text: 'RDP — sedans (MGMT lane)' },
   { proto: 'SMB',   text: 'SMB/FTP — cargo vans (FILE lane)' },
   { proto: 'SNMP',  text: 'SNMP — drones (INFRA lane)' },
   { proto: 'DHCP',  text: 'DHCP · NTP · syslog — drones' },
-  { proto: 'UDP',   text: 'Other UDP — drones (connectionless: airborne)' },
+  { proto: 'UDP',   text: 'Other UDP — drones (airborne)' },
   { proto: 'TCP',   text: 'Other TCP — sedans' },
   { proto: 'ARP',   text: 'ARP/L2 — maintenance carts' },
 ];

@@ -41,15 +41,30 @@ flow-level view that tools like sFlow/NetFlow make at scale. **Every packet is
 always counted in the dashboard stats**; only the visual aggregates. The
 `MERGED` HUD counter tells you how many packets rode in convoys.
 
-### No ghosting: sub-lanes and car-following
+### A timing-faithful road (and why vehicles never collide)
 
-Every protocol lane is split into two sub-lanes — **cruise** (outer) and
-**passing** (inner). Within a sub-lane, vehicles obey a follow-the-leader
-model: a faster vehicle closes up, matches the leader's speed, and merges into
-the passing sub-lane to overtake when there's a safe gap (with a closing-speed
-allowance, like a real merge). Vehicles therefore never drive through each
-other — fast SYN cars visibly weave past heavy HTTPS trucks instead of ghosting
-through them. UDP drones are airborne and separate by altitude instead of lanes.
+Every vehicle in a lane moves at the **lane's constant speed**, so a vehicle's
+distance from its entry gate is exactly *(now − arrival time) × lane speed*:
+the road is a scrolling timeline, and the spacing between same-lane vehicles
+is their **real inter-arrival spacing**. Packets don't brake, and neither do
+vehicles — because same-lane speeds never differ, overtaking (the only way
+vehicles could ghost through each other) is geometrically impossible.
+
+Collisions are avoided purely at admission: a packet arriving while the
+previous one still occupies the entry takes the parallel **sub-lane** (each
+lane is two files of traffic); when both files are occupied, the burst rides
+as a **convoy** (log-scaled by packet count — engineers think in orders of
+magnitude). UDP drones are airborne and separate by altitude instead.
+
+### TCP telemetry
+
+Beyond the failure counters, the flow tracker passively measures **handshake
+RTT** (SYN→SYN-ACK, median/p95 in the TCP HEALTH panel) and counts **SYN
+retries**, with kernel retransmit schedules de-duplicated so one dead connect()
+isn't counted as several failures. Shoulder flares **stack per target** —
+a dead service grows one tall flare, a port scan paints a strip of them.
+Clicking any vehicle (or flare) **spotlights its whole conversation**: every
+vehicle in that 4-tuple keeps its color while the rest of the road dims.
 
 ### TCP handshake troubleshooting
 
