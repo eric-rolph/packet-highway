@@ -86,7 +86,12 @@ impl PlatformRadio for AndroidRadio {
             .map_err(|e| CoreError::Radio(format!("byte_array_from_slice: {e}")))?;
         let obj: &JObject = arr.as_ref();
         let ok = env
-            .call_method(&self.radio, "startAdvertising", "([B)Z", &[JValue::Object(obj)])
+            .call_method(
+                &self.radio,
+                "startAdvertising",
+                "([B)Z",
+                &[JValue::Object(obj)],
+            )
             .and_then(|v| v.z())
             .map_err(|e| {
                 let _ = env.exception_clear();
@@ -216,9 +221,13 @@ pub extern "system" fn Java_com_meshcore_MeshCoreNative_nativeCreate<'local>(
         nickname,
         identity_seed,
         ttl: if ttl <= 0 || ttl > 255 { 6 } else { ttl as u8 },
+        epoch: None,
     };
 
-    let radio = Arc::new(AndroidRadio { vm, radio: radio_ref });
+    let radio = Arc::new(AndroidRadio {
+        vm,
+        radio: radio_ref,
+    });
     match MeshHandle::new_internal(cfg, radio) {
         Ok(handle) => Box::into_raw(handle) as jlong,
         Err(e) => {
@@ -297,7 +306,9 @@ pub extern "system" fn Java_com_meshcore_MeshCoreNative_nativePublicKey<'local>(
     handle: jlong,
 ) -> JByteArray<'local> {
     match as_handle(handle) {
-        Some(h) => env.byte_array_from_slice(&h.core().public_key()).unwrap_or_default(),
+        Some(h) => env
+            .byte_array_from_slice(&h.core().public_key())
+            .unwrap_or_default(),
         None => JByteArray::default(),
     }
 }
@@ -412,9 +423,10 @@ pub extern "system" fn Java_com_meshcore_MeshCoreNative_nativeIngestDirect(
         return MeshStatus::InvalidArgument as jint;
     }
 
-    let (Ok(ptr), Ok(cap)) =
-        (env.get_direct_buffer_address(&buffer), env.get_direct_buffer_capacity(&buffer))
-    else {
+    let (Ok(ptr), Ok(cap)) = (
+        env.get_direct_buffer_address(&buffer),
+        env.get_direct_buffer_capacity(&buffer),
+    ) else {
         set_last_error("not a direct ByteBuffer");
         return MeshStatus::InvalidArgument as jint;
     };
@@ -444,5 +456,6 @@ pub extern "system" fn Java_com_meshcore_MeshCoreNative_nativeLastError<'local>(
     // Note the thread-local: this must be called on the same thread that saw
     // the failing call, which is how Kotlin uses it (immediately after a
     // non-zero status on the same JNI thread).
-    env.new_string(crate::c_api::last_error_string()).unwrap_or_default()
+    env.new_string(crate::c_api::last_error_string())
+        .unwrap_or_default()
 }

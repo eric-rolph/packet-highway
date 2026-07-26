@@ -41,11 +41,19 @@ impl MeshBuffer {
     /// Transfer ownership of `v`'s allocation to the caller. O(1), no copy.
     pub fn from_vec(v: Vec<u8>) -> Self {
         let mut v = ManuallyDrop::new(v);
-        MeshBuffer { ptr: v.as_mut_ptr(), len: v.len(), cap: v.capacity() }
+        MeshBuffer {
+            ptr: v.as_mut_ptr(),
+            len: v.len(),
+            cap: v.capacity(),
+        }
     }
 
     pub fn empty() -> Self {
-        MeshBuffer { ptr: std::ptr::null_mut(), len: 0, cap: 0 }
+        MeshBuffer {
+            ptr: std::ptr::null_mut(),
+            len: 0,
+            cap: 0,
+        }
     }
 
     /// # Safety

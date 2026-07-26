@@ -1,0 +1,117 @@
+name: meshcore
+
+# Scoped to mesh/ so the Python/Three.js side of the repo is unaffected.
+on:
+  push:
+    branches: [main]
+    paths: ['mesh/**', '.github/workflows/meshcore.yml']
+  pull_request:
+    paths: ['mesh/**', '.github/workflows/meshcore.yml']
+
+concurrency:
+  group: meshcore-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail on warnings in CI without making local `cargo build` miserable.
+  RUSTFLAGS: -D warnings
+
+defaults:
+  run:
+    working-directory: mesh
+
+jobs:
+  rust:
+    name: rust (fmt, clippy, test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: mesh/rust
+
+      - name: Format
+        run: cargo fmt --manifest-path rust/Cargo.toml --all --check
+
+      - name: Clippy
+        run: cargo clippy --manifest-path rust/Cargo.toml --all-targets --all-features
+
+      - name: Test
+        run: cargo test --manifest-path rust/Cargo.toml --all-features
+
+      - name: Header is up to date
+        # cbindgen runs in build.rs, so a stale committed header cannot happen —
+        # but a cbindgen failure only warns. Assert the header actually exists
+        # and declares the ABI entry point.
+        run: |
+          test -f rust/meshcore-ffi/include/meshcore.h
+          grep -q 'uint32_t mesh_abi_version' rust/meshcore-ffi/include/meshcore.h
+
+  cross:
+    name: cross-compile (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # `cargo check` does not link, so these validate the mobile targets
+        # without an NDK or Xcode. Catches target-gated code (JNI signatures,
+        # libc differences) in seconds instead of at the end of a device build.
+        target:
+          - aarch64-linux-android
+          - armv7-linux-androideabi
+          - aarch64-apple-ios
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: mesh/rust
+          key: ${{ matrix.target }}
+
+      - run: cargo check --manifest-path rust/Cargo.toml -p meshcore-ffi --target ${{ matrix.target }}
+
+  js:
+    name: js (typecheck, wire-format contract)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # The contract test shells out to `cargo run --example
+      # dump_event_fixtures`, so the decoder is checked against bytes from the
+      # real Rust encoder rather than a hand-copied fixture.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: mesh/rust
+
+      - name: Typecheck
+        run: |
+          npm install --no-save --silent typescript@5.4
+          npx tsc -p js/tsconfig.ci.json
+
+      - name: Wire-format contract (Rust encoder -> TS decoder)
+        run: node --test test/decode.test.mjs
+        working-directory: mesh/js
+
+  shell:
+    name: shellcheck build scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck scripts/build-ios.sh scripts/build-android.sh

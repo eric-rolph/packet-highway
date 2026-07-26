@@ -138,7 +138,7 @@ std::vector<jsi::PropNameID> MeshCoreHostObject::getPropertyNames(
   std::vector<std::string> names{
       "abiVersion", "publicKey",   "start", "stop",  "isRunning",
       "send",       "receive",     "peers", "setEventListener",
-      "droppedEvents"};
+      "droppedEvents", "outboxLen"};
   std::vector<jsi::PropNameID> out;
   out.reserve(names.size());
   for (auto& n : names) {
@@ -158,6 +158,10 @@ jsi::Value MeshCoreHostObject::get(jsi::Runtime& rt,
   if (name == "droppedEvents") {
     return jsi::Value(
         static_cast<double>(dropped_.load(std::memory_order_relaxed)));
+  }
+
+  if (name == "outboxLen") {
+    return jsi::Value(static_cast<double>(mesh_outbox_len(handle_)));
   }
 
   if (name == "publicKey") {

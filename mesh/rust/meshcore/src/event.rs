@@ -25,6 +25,7 @@ pub const KIND_MESSAGE_RECEIVED: u8 = 3;
 pub const KIND_MESSAGE_DELIVERED: u8 = 4;
 pub const KIND_TRANSPORT_STATE: u8 = 5;
 pub const KIND_ERROR: u8 = 6;
+pub const KIND_MESSAGE_EXPIRED: u8 = 7;
 
 #[derive(Debug, Clone)]
 pub struct Event {
@@ -35,21 +36,60 @@ pub struct Event {
 
 #[derive(Debug, Clone)]
 pub enum EventKind {
-    PeerDiscovered { peer: PeerId, nickname: String, rssi: i8, hops: u8 },
-    PeerLost { peer: PeerId },
-    MessageReceived { sender: PeerId, msg_id: [u8; 16], ttl: u8, hops: u8, rssi: i8, body: Vec<u8> },
-    MessageDelivered { msg_id: [u8; 16], direct: bool },
-    TransportState { running: bool },
-    Error { message: String },
+    PeerDiscovered {
+        peer: PeerId,
+        nickname: String,
+        rssi: i8,
+        hops: u8,
+    },
+    PeerLost {
+        peer: PeerId,
+    },
+    MessageReceived {
+        sender: PeerId,
+        msg_id: [u8; 16],
+        ttl: u8,
+        hops: u8,
+        rssi: i8,
+        body: Vec<u8>,
+    },
+    MessageDelivered {
+        msg_id: [u8; 16],
+        direct: bool,
+    },
+    /// A directed message was never acked and hit its deadline, or was evicted
+    /// from a full outbox. The UI should mark it failed rather than pending.
+    MessageExpired {
+        msg_id: [u8; 16],
+        reason: String,
+    },
+    TransportState {
+        running: bool,
+    },
+    Error {
+        message: String,
+    },
 }
 
 impl Event {
     fn new(seq: u32, kind: EventKind) -> Self {
-        Self { seq, ts_ms: crate::now_ms(), kind }
+        Self {
+            seq,
+            ts_ms: crate::now_ms(),
+            kind,
+        }
     }
 
     pub fn peer_discovered(seq: u32, peer: PeerId, nickname: &str, rssi: i8, hops: u8) -> Self {
-        Self::new(seq, EventKind::PeerDiscovered { peer, nickname: nickname.to_owned(), rssi, hops })
+        Self::new(
+            seq,
+            EventKind::PeerDiscovered {
+                peer,
+                nickname: nickname.to_owned(),
+                rssi,
+                hops,
+            },
+        )
     }
 
     pub fn peer_lost(seq: u32, peer: PeerId) -> Self {
@@ -65,11 +105,31 @@ impl Event {
         rssi: i8,
         body: Vec<u8>,
     ) -> Self {
-        Self::new(seq, EventKind::MessageReceived { sender, msg_id, ttl, hops, rssi, body })
+        Self::new(
+            seq,
+            EventKind::MessageReceived {
+                sender,
+                msg_id,
+                ttl,
+                hops,
+                rssi,
+                body,
+            },
+        )
     }
 
     pub fn message_delivered(seq: u32, msg_id: [u8; 16], direct: bool) -> Self {
         Self::new(seq, EventKind::MessageDelivered { msg_id, direct })
+    }
+
+    pub fn message_expired(seq: u32, msg_id: [u8; 16], reason: &str) -> Self {
+        Self::new(
+            seq,
+            EventKind::MessageExpired {
+                msg_id,
+                reason: reason.to_owned(),
+            },
+        )
     }
 
     pub fn transport_state(seq: u32, running: bool) -> Self {
@@ -77,7 +137,12 @@ impl Event {
     }
 
     pub fn error(seq: u32, message: &str) -> Self {
-        Self::new(seq, EventKind::Error { message: message.to_owned() })
+        Self::new(
+            seq,
+            EventKind::Error {
+                message: message.to_owned(),
+            },
+        )
     }
 
     pub fn kind_tag(&self) -> u8 {
@@ -86,6 +151,7 @@ impl Event {
             EventKind::PeerLost { .. } => KIND_PEER_LOST,
             EventKind::MessageReceived { .. } => KIND_MESSAGE_RECEIVED,
             EventKind::MessageDelivered { .. } => KIND_MESSAGE_DELIVERED,
+            EventKind::MessageExpired { .. } => KIND_MESSAGE_EXPIRED,
             EventKind::TransportState { .. } => KIND_TRANSPORT_STATE,
             EventKind::Error { .. } => KIND_ERROR,
         }
@@ -100,6 +166,7 @@ impl Event {
             EventKind::PeerLost { .. } => 32,
             EventKind::MessageReceived { body, .. } => 32 + 16 + 4 + 4 + body.len(),
             EventKind::MessageDelivered { .. } => 16 + 4,
+            EventKind::MessageExpired { reason, .. } => 16 + 4 + reason.len(),
             EventKind::TransportState { .. } => 4,
             EventKind::Error { message } => 4 + message.len(),
         };
@@ -113,14 +180,26 @@ impl Event {
         debug_assert_eq!(w.len(), EVENT_HEADER_LEN);
 
         match &self.kind {
-            EventKind::PeerDiscovered { peer, nickname, rssi, hops } => {
+            EventKind::PeerDiscovered {
+                peer,
+                nickname,
+                rssi,
+                hops,
+            } => {
                 w.extend_from_slice(peer);
                 w.push(*rssi as u8);
                 w.push(*hops);
                 put_bytes(&mut w, nickname.as_bytes());
             }
             EventKind::PeerLost { peer } => w.extend_from_slice(peer),
-            EventKind::MessageReceived { sender, msg_id, ttl, hops, rssi, body } => {
+            EventKind::MessageReceived {
+                sender,
+                msg_id,
+                ttl,
+                hops,
+                rssi,
+                body,
+            } => {
                 w.extend_from_slice(sender);
                 w.extend_from_slice(msg_id);
                 w.push(*ttl);
@@ -133,6 +212,10 @@ impl Event {
                 w.extend_from_slice(msg_id);
                 w.push(*direct as u8);
                 w.extend_from_slice(&[0u8; 3]);
+            }
+            EventKind::MessageExpired { msg_id, reason } => {
+                w.extend_from_slice(msg_id);
+                put_bytes(&mut w, reason.as_bytes());
             }
             EventKind::TransportState { running } => {
                 w.push(*running as u8);
@@ -181,6 +264,7 @@ mod tests {
             Event::peer_lost(2, [0u8; 32]),
             Event::message_received(3, [0u8; 32], [0u8; 16], 4, 0, -50, vec![0; 200]),
             Event::message_delivered(4, [0u8; 16], true),
+            Event::message_expired(7, [0u8; 16], "no ack"),
             Event::transport_state(5, true),
             Event::error(6, "boom"),
         ] {

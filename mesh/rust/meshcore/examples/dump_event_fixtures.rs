@@ -16,13 +16,23 @@ fn main() {
     let msg_id = [0xBBu8; 16];
 
     let fixtures: Vec<(&str, Event)> = vec![
-        ("peerDiscovered", Event::peer_discovered(1, peer, "ada-löve", -42, 3)),
+        (
+            "peerDiscovered",
+            Event::peer_discovered(1, peer, "ada-löve", -42, 3),
+        ),
         ("peerLost", Event::peer_lost(2, peer)),
         (
             "messageReceived",
             Event::message_received(3, peer, msg_id, 6, 2, -71, b"hello mesh".to_vec()),
         ),
-        ("messageDelivered", Event::message_delivered(4, msg_id, true)),
+        (
+            "messageDelivered",
+            Event::message_delivered(4, msg_id, true),
+        ),
+        (
+            "messageExpired",
+            Event::message_expired(7, msg_id, "no ack"),
+        ),
         ("transportState", Event::transport_state(5, true)),
         ("error", Event::error(6, "radio failure: scan denied")),
     ];

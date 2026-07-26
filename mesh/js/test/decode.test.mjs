@@ -94,6 +94,13 @@ test('messageDelivered round-trips', () => {
   assert.equal(peerIdToHex(e.messageId), 'bb'.repeat(16));
 });
 
+test('messageExpired round-trips', () => {
+  const e = decodeEvent(toArrayBuffer(cases.messageExpired.hex));
+  assert.equal(e.type, 'messageExpired');
+  assert.equal(e.reason, 'no ack');
+  assert.equal(peerIdToHex(e.messageId), 'bb'.repeat(16));
+});
+
 test('transportState round-trips', () => {
   const e = decodeEvent(toArrayBuffer(cases.transportState.hex));
   assert.equal(e.type, 'transportState');
@@ -110,6 +117,17 @@ test('an ABI version bump fails loudly instead of decoding garbage', () => {
   const buf = toArrayBuffer(cases.messageReceived.hex);
   new Uint8Array(buf)[0] = 99;
   assert.throws(() => decodeEvent(buf), /ABI 99/);
+});
+
+test('every event kind Rust emits has a decoder branch', () => {
+  // Guards the drift this whole file exists to catch: adding a variant to
+  // event.rs without adding a case here would otherwise only fail at runtime,
+  // on a device, as an "unknown event kind".
+  for (const [name, f] of Object.entries(cases)) {
+    const e = decodeEvent(toArrayBuffer(f.hex));
+    assert.equal(e.seq, f.seq, `${name} seq`);
+    assert.ok(e.type, `${name} decoded to a typed event`);
+  }
 });
 
 test('a truncated event throws', () => {

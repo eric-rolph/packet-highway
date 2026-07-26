@@ -114,7 +114,9 @@ mesh/
 │   ├── meshcore/                      ── PURE RUST, host-testable, zero FFI
 │   │   ├── src/lib.rs                 MeshCore, worker thread, PlatformRadio/EventSink traits
 │   │   ├── src/crypto.rs              X25519 + ChaCha20-Poly1305, Identity
-│   │   ├── src/frame.rs               wire format, seal/open/relay
+│   │   ├── src/frame.rs               wire format v2, build/open/relay
+│   │   ├── src/replay.rs              per-sender sliding anti-replay window
+│   │   ├── src/outbox.rs              store-and-forward: acks, backoff, expiry
 │   │   ├── src/event.rs               events + the binary layout JS decodes
 │   │   └── examples/dump_event_fixtures.rs   feeds the JS contract test
 │   └── meshcore-ffi/                  ── THE ONLY CRATE WITH #[no_mangle]
@@ -323,6 +325,59 @@ the boundary cost for the same work.
 
 ---
 
+## 5b. Delivery, replay and store-and-forward
+
+Three properties a flood mesh does not give you for free, added in the core so
+both platforms get them identically.
+
+### Anti-replay (`replay.rs`)
+
+The msg_id dedup cache is a 4096-entry LRU. It stops flood loops, but it is
+bounded — capture a frame, replay it after 4096 other messages, and it is
+delivered twice. In a busy room that is seconds.
+
+So every frame carries an authenticated `(epoch, counter)` pair and each sender
+gets a 64-bit sliding window, the same shape as IPsec's (RFC 4303 §3.4.3):
+in-order traffic always passes, reordering within 64 frames is tolerated, exact
+replays are `Duplicate`, and anything older is `TooOld`.
+
+Two details carry the weight:
+
+- **The window is consulted *after* the AEAD verifies, never before.** Checking
+  first would let an attacker spray forged high counters and lock out the real
+  sender — a replay defence turned into a denial of service.
+- **`epoch` handles restarts.** A restarted node resets its counter to zero,
+  which is indistinguishable from a replay; a higher epoch resets the window,
+  and a *lower* one is refused, so re-injecting a whole captured session fails.
+  Epoch defaults to the wall clock at construction, which is monotonic across
+  restarts **unless the clock rolls back**. That is the known weakness; the fix
+  is a persisted boot counter, one `u64` in the same Keychain/Keystore blob as
+  the identity seed. `Config::epoch` already accepts it.
+
+### Delivery receipts and retransmit (`outbox.rs`)
+
+Directed messages are held until the recipient acks, then retried with capped
+exponential backoff (1s → 15s) until a 120s deadline, after which the UI gets a
+`messageExpired` event instead of a message stuck on "sending" forever.
+Broadcasts are not retried — there is no single recipient to ack one — and are
+reported delivered as soon as they are on the air.
+
+Retries reuse the **original frame bytes** rather than re-sealing. Re-sealing
+would burn a fresh counter per attempt and punch holes in the recipient's replay
+window; there is a test pinning that (`retries_reuse_the_original_frame`).
+
+The queue is bounded at 256 with oldest-first eviction, so a peer that never
+returns cannot grow it without limit.
+
+### Walking back into range
+
+The backoff timer is the fallback, not the mechanism. When a peer is
+*discovered*, everything queued for them is made due immediately and flushed —
+which is what makes a mesh messenger feel like a mesh messenger rather than a
+retry loop. `a_peer_walking_into_range_flushes_the_queue_immediately` covers it.
+
+---
+
 ## 6. Wire formats
 
 Both are little-endian (both mobile targets are LE) and versioned by
@@ -330,19 +385,21 @@ Both are little-endian (both mobile targets are LE) and versioned by
 stops a cached `.so` from an older build from silently mis-decoding every event
 into plausible-looking garbage.
 
-**Frame** (100-byte header + optional nickname + AEAD ciphertext):
+**Frame v2** (116-byte header + optional nickname + AEAD ciphertext):
 
 ```
 0   magic 'M' │ 1  version │ 2  flags │ 3  ttl* │ 4  hops* │ 5  nick_len
-6   body_len u16 │ 8  sender[32] │ 40 recipient[32] │ 72 msg_id[16] │ 88 nonce[12]
-100 nickname │ … ciphertext‖tag
+6   body_len u16 │ 8  epoch u64 │ 16 counter u64
+24  sender[32] │ 56 recipient[32] │ 88 msg_id[16] │ 104 nonce[12]
+116 nickname │ … ciphertext‖tag
 ```
 
 `ttl`/`hops` (marked `*`) are **outside the AAD** — a relay must be able to
-decrement TTL without holding a key. Everything usable to redirect or replay a
-message (sender, recipient, msg_id, nonce, lengths) is inside it.
-`relaying_preserves_authenticity` and `header_tampering_is_caught` pin both
-halves of that.
+decrement TTL without holding a key. Everything else is inside it, including
+`epoch` and `counter`, which is what makes the anti-replay window trustworthy.
+`header_tampering_is_caught` flips **every** authenticated header byte one at a
+time and asserts each is detected; `relaying_preserves_authenticity` asserts the
+two mutable ones are not.
 
 **Event**: 16-byte header (`version, kind, flags, seq, ts_ms`) then a
 kind-specific body, serialised into exactly one heap allocation whose capacity
@@ -385,23 +442,52 @@ Two build choices worth stating:
 
 ## 8. Test coverage today
 
-29 tests, all runnable on a laptop with no device:
+58 tests, all runnable on a laptop with no device, all enforced by CI
+(`.github/workflows/meshcore.yml`).
 
-- **18 Rust** (`cargo test`) — AEAD tamper rejection, symmetric key agreement,
-  frame roundtrip/relay/tamper, garbage-input fuzz-lite, dedup suppression,
-  a **two-node mesh handshake** (A broadcasts, bytes are handed to B, B
-  discovers A and decrypts), full C-ABI lifecycle with a mock radio + sink,
-  null-safety on every entry point, `MeshBuffer` non-copying roundtrip.
-- **11 JS** (`node --test`) — the decoder against bytes emitted by the *actual*
+- **45 Rust** (`cargo test`):
+  - *crypto* — AEAD tamper rejection, wrong-AAD rejection, symmetric key agreement.
+  - *frame* — broadcast/directed roundtrip, relay preserves authenticity,
+    **every** authenticated header byte flipped one at a time, epoch/counter
+    authentication, multibyte nickname truncation on a char boundary, v1 frames
+    rejected rather than misparsed, garbage input.
+  - *replay* — in-order traffic, exact replay, reordering inside the window,
+    beyond-window rejection, a >64 jump that would be a shift overflow, restart
+    resets, whole-session replay refused, `u64::MAX` saturation.
+  - *outbox* — backoff growth and cap, ack removal, peer-discovery wake, bounded
+    eviction, retry byte-identity, re-queue consistency.
+  - *core* — two-node mesh handshake, dedup suppression, **replay rejected even
+    with a fresh msg_id** (the case dedup cannot see), directed ack clears the
+    outbox, broadcast needs no ack, unacked retry, a relay carrying a frame it
+    cannot read, own re-flood ignored, queue flush on peer discovery.
+  - *FFI* — full C-ABI lifecycle with a mock radio and sink, null-safety on every
+    entry point, garbage-ingest fuzz over every prefix length, `MeshBuffer`
+    non-copying roundtrip.
+- **13 JS** (`node --test`) — the decoder against bytes emitted by the *actual*
   Rust encoder, including signed RSSI, non-ASCII nicknames, the zero-copy view
-  assertion (`body.buffer === source`), ABI-mismatch and truncation failures.
+  assertion (`body.buffer === source`), ABI-mismatch and truncation failures, and
+  a check that every event kind Rust emits has a decoder branch.
 
 That last suite matters more than its size suggests: `event.rs` and `events.ts`
 have no compiler between them, so a hand-written decoder drifting from the
 encoder is the single most likely way this project breaks. The test regenerates
 fixtures from Rust on every run.
 
----
+### CI
+
+`.github/workflows/meshcore.yml`, scoped to `mesh/**`:
+
+| job | what it catches |
+|---|---|
+| `rust` | `cargo fmt --check`, `clippy -D warnings`, `cargo test`, header presence |
+| `cross` | `cargo check` for aarch64-android, armv7-android, aarch64-ios |
+| `js` | strict `tsc` on the decoder + the wire-format contract test |
+| `shell` | `shellcheck` on both build scripts |
+
+The `cross` job is the cheap one worth calling out: `cargo check` does not link,
+so the mobile targets validate on a plain Ubuntu runner in seconds — no NDK, no
+Xcode, no macOS minutes. It catches target-gated breakage (JNI signatures, libc
+differences) long before a device build would.
 
 ## 9. What is scaffolding, and what to do next
 
@@ -413,10 +499,12 @@ Honest inventory of what is *not* production-ready:
    complete — but compromising a long-term key retroactively decrypts
    everything. Broadcast uses a group key derived from a constant channel
    secret. Replace with Noise XX + a Double Ratchet per peer; `crypto.rs` is
-   shaped so that swap stays local to the module.
-2. **No replay window.** Dedup is a 4096-entry LRU of message ids, which stops
-   flood loops but not a determined replay after eviction. Add a per-sender
-   monotonic counter inside the AAD.
+   shaped so that swap stays local to the module. **This is the biggest
+   remaining gap and deserves its own change** — it is a wire-format break and a
+   design decision (Noise XX vs X3DH vs rotating prekeys), not a patch.
+2. **Epoch depends on the wall clock.** See §5b: a device whose clock rolls
+   backwards has its frames refused by peers until it restarts with a good
+   clock. Fix is a persisted boot counter; `Config::epoch` already takes one.
 3. **GATT is stubbed on Android.** `MeshRadio.sendDirect` returns `false`, so
    Rust floods. Correct behaviour, but directed sends never get the fast path
    until the `peerId → BluetoothGatt` map is wired up.
@@ -426,6 +514,13 @@ Honest inventory of what is *not* production-ready:
    foreground service, or the scanner is throttled to ~1 result per 5 minutes
    with the screen off.
 5. **Identity is not persisted.** The 32-byte seed should go in the Keychain
-   (iOS) / Keystore-wrapped (Android) and be passed to `initializeCore`.
-6. **No store-and-forward.** The core drops frames for offline peers rather
-   than queueing them.
+   (iOS) / Keystore-wrapped (Android) and be passed to `initializeCore`. Pair it
+   with the boot counter from (2) — same blob, same write.
+6. **Relay-side store-and-forward is not implemented.** A node retries its *own*
+   undelivered messages (§5b), but does not cache and later re-flood frames it
+   merely relayed for a peer that was out of range. That is the difference
+   between a mesh that heals over minutes and one that heals over hours.
+7. **The native layers are unverified by CI.** The Objective-C++ and
+   Kotlin/CMake code compiles only under Xcode and the Android NDK, neither of
+   which is on the CI runner. `cargo check` covers the mobile *Rust* targets;
+   the platform layers need a macOS runner and an SDK image to gate properly.

@@ -21,7 +21,7 @@ pub mod c_api;
 pub use buffer::{mesh_buffer_free, MeshBuffer};
 pub use c_api::{
     mesh_abi_version, mesh_core_free, mesh_core_new, mesh_core_public_key,
-    mesh_core_set_event_sink, mesh_ingest, mesh_is_running, mesh_last_error, mesh_peers,
-    mesh_receive_message, mesh_send_message, mesh_start_broadcasting, mesh_stop_broadcasting,
-    MeshConfig, MeshEventSink, MeshHandle, MeshPlatformRadio, MeshStatus,
+    mesh_core_set_event_sink, mesh_ingest, mesh_is_running, mesh_last_error, mesh_outbox_len,
+    mesh_peers, mesh_receive_message, mesh_send_message, mesh_start_broadcasting,
+    mesh_stop_broadcasting, MeshConfig, MeshEventSink, MeshHandle, MeshPlatformRadio, MeshStatus,
 };

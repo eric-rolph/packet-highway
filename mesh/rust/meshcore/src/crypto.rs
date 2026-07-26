@@ -109,14 +109,24 @@ pub fn network_key() -> [u8; 32] {
 }
 
 /// AEAD seal. Returns `ciphertext || tag`.
-pub fn seal_aead(key: &[u8; 32], nonce: &[u8; NONCE_LEN], aad: &[u8], pt: &[u8]) -> Result<Vec<u8>, CoreError> {
+pub fn seal_aead(
+    key: &[u8; 32],
+    nonce: &[u8; NONCE_LEN],
+    aad: &[u8],
+    pt: &[u8],
+) -> Result<Vec<u8>, CoreError> {
     ChaCha20Poly1305::new(Key::from_slice(key))
         .encrypt(Nonce::from_slice(nonce), Payload { msg: pt, aad })
         .map_err(|_| CoreError::Crypto("seal"))
 }
 
 /// AEAD open. Input is `ciphertext || tag`.
-pub fn open_aead(key: &[u8; 32], nonce: &[u8; NONCE_LEN], aad: &[u8], ct: &[u8]) -> Result<Vec<u8>, CoreError> {
+pub fn open_aead(
+    key: &[u8; 32],
+    nonce: &[u8; NONCE_LEN],
+    aad: &[u8],
+    ct: &[u8],
+) -> Result<Vec<u8>, CoreError> {
     if ct.len() < TAG_LEN {
         return Err(CoreError::Crypto("ciphertext shorter than tag"));
     }
@@ -150,7 +160,10 @@ mod tests {
     fn direct_key_is_symmetric() {
         let a = Identity::from_seed([3u8; 32]);
         let b = Identity::from_seed([4u8; 32]);
-        assert_eq!(a.derive_direct_key(&b.public_id()), b.derive_direct_key(&a.public_id()));
+        assert_eq!(
+            a.derive_direct_key(&b.public_id()),
+            b.derive_direct_key(&a.public_id())
+        );
     }
 
     #[test]

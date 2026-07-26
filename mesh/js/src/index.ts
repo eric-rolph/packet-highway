@@ -27,6 +27,7 @@ export * from './events';
 interface MeshCoreJSI {
   readonly abiVersion: number;
   readonly droppedEvents: number;
+  readonly outboxLen: number;
   publicKey(): ArrayBuffer;
   start(): void;
   stop(): void;
@@ -195,6 +196,14 @@ class Mesh {
   /** Events dropped because no listener was attached or JS threw. */
   get droppedEvents(): number {
     return this.#jsi?.droppedEvents ?? 0;
+  }
+
+  /**
+   * Directed messages sent but not yet acked. Drains as acks arrive; entries
+   * that never get one surface as `messageExpired`.
+   */
+  get pendingCount(): number {
+    return this.#jsi?.outboxLen ?? 0;
   }
 
   /** Android: permissions still needing a runtime request. Empty on iOS. */

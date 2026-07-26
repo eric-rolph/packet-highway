@@ -16,8 +16,9 @@
 //!
 //! So the split is:
 //!
-//! * **Rust owns**: framing, dedup, TTL/flood routing, store-and-forward queue,
-//!   session key agreement, AEAD, retransmit timers, peer table.
+//! * **Rust owns**: framing, dedup, anti-replay, TTL/flood routing,
+//!   store-and-forward, session key agreement, AEAD, retransmit timers,
+//!   peer table.
 //! * **Platform owns**: turning the radio on, emitting an advertisement blob
 //!   Rust handed it, and pushing received advertisement blobs back down.
 //!
@@ -25,31 +26,39 @@
 //! that keeps 95% of the logic host-testable.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub mod crypto;
 pub mod event;
 pub mod frame;
+pub mod outbox;
+pub mod replay;
 
 pub use crypto::{Identity, PeerId};
 pub use event::{Event, EventKind};
-pub use frame::{FrameError, ParsedFrame};
+pub use frame::{FrameError, FrameKind, ParsedFrame};
+pub use outbox::Outbox;
+pub use replay::{ReplayVerdict, ReplayWindow};
 
 /// Bumped whenever the C ABI or the binary event layout changes. The native
 /// layer asserts this at install time so a stale `.so` can never silently
 /// mis-decode events.
-pub const ABI_VERSION: u32 = 1;
+pub const ABI_VERSION: u32 = 2;
 
 /// Max hops a flooded frame may take before it is dropped.
 const DEFAULT_TTL: u8 = 6;
 /// How many recently-seen message ids we remember for loop suppression.
 const DEDUP_CAPACITY: usize = 4096;
-/// Cadence of the housekeeping tick (retransmit, dedup GC, peer expiry).
+/// Cadence of the housekeeping tick (retransmit, peer expiry).
 const TICK: Duration = Duration::from_millis(250);
 /// A peer we have not heard from in this long is considered gone.
 const PEER_TTL: Duration = Duration::from_secs(30);
+/// How often to re-emit our discovery beacon.
+const BEACON_INTERVAL_MS: u64 = 2_000;
+/// Cap on the inbox, drained synchronously by JS via `receive_message`.
+const INBOX_CAPACITY: usize = 256;
 
 // ---------------------------------------------------------------------------
 // Injected platform capability
@@ -116,17 +125,25 @@ impl From<FrameError> for CoreError {
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// Human-visible name broadcast in the advertisement. Truncated to 20 bytes
-    /// to fit a BLE legacy ADV_IND PDU alongside the service UUID + pubkey hint.
+    /// Human-visible name broadcast in the beacon. Truncated to 20 bytes.
     pub nickname: String,
     /// 32-byte seed for the long-term identity key. `None` = generate.
     pub identity_seed: Option<[u8; 32]>,
     pub ttl: u8,
+    /// Session epoch, stamped into every frame for anti-replay. Defaults to the
+    /// wall clock at construction; pass a persisted boot counter if you have
+    /// one (see `replay.rs` for why that is better).
+    pub epoch: Option<u64>,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { nickname: String::from("anon"), identity_seed: None, ttl: DEFAULT_TTL }
+        Self {
+            nickname: String::from("anon"),
+            identity_seed: None,
+            ttl: DEFAULT_TTL,
+            epoch: None,
+        }
     }
 }
 
@@ -152,8 +169,15 @@ enum Command {
     Stop,
     /// Owned copy of an inbound advertisement. The FFI layer only ever borrows
     /// the platform's buffer; this is where the one unavoidable copy happens.
-    Ingest { rssi: i8, bytes: Vec<u8> },
-    Send { to: Option<PeerId>, body: Vec<u8>, msg_id: [u8; 16] },
+    Ingest {
+        rssi: i8,
+        bytes: Vec<u8>,
+    },
+    Send {
+        to: Option<PeerId>,
+        body: Vec<u8>,
+        msg_id: [u8; 16],
+    },
     Shutdown,
 }
 
@@ -161,8 +185,8 @@ enum Command {
 // Core
 // ---------------------------------------------------------------------------
 
-/// Owning handle to the mesh. Cheap to clone (`Arc` inside); the FFI layer
-/// keeps exactly one and hands out a raw pointer to it.
+/// Owning handle to the mesh. The FFI layer keeps exactly one and hands out a
+/// raw pointer to it.
 pub struct MeshCore {
     tx: mpsc::Sender<Command>,
     running: Arc<AtomicBool>,
@@ -171,6 +195,8 @@ pub struct MeshCore {
     peers: Arc<Mutex<HashMap<PeerId, Peer>>>,
     /// Synchronous drain queue for the JSI pull path (`receive_message`).
     inbox: Arc<Mutex<VecDeque<Event>>>,
+    /// Depth of the retransmit queue, readable without touching the worker.
+    outbox_len: Arc<AtomicU64>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -184,24 +210,32 @@ impl MeshCore {
             Some(seed) => Identity::from_seed(seed),
             None => Identity::generate()?,
         };
+        let epoch = config.epoch.unwrap_or_else(now_ms);
 
         let (tx, rx) = mpsc::channel();
         let running = Arc::new(AtomicBool::new(false));
         let seq = Arc::new(AtomicU32::new(0));
         let peers: Arc<Mutex<HashMap<PeerId, Peer>>> = Arc::new(Mutex::new(HashMap::new()));
         let inbox = Arc::new(Mutex::new(VecDeque::new()));
+        let outbox_len = Arc::new(AtomicU64::new(0));
 
         let mut worker_state = Worker {
             config: config.clone(),
             identity: identity.clone(),
+            epoch,
+            counter: 0,
             radio,
             sink,
             running: running.clone(),
             seq: seq.clone(),
             peers: peers.clone(),
             inbox: inbox.clone(),
+            outbox: Outbox::default(),
+            outbox_len: outbox_len.clone(),
+            replay: HashMap::new(),
             seen: VecDeque::with_capacity(DEDUP_CAPACITY),
             seen_set: HashMap::new(),
+            last_beacon_ms: 0,
         };
 
         // A single OS thread, not a tokio runtime. The workload is timer-driven
@@ -213,7 +247,16 @@ impl MeshCore {
             .spawn(move || worker_state.run(rx))
             .map_err(|e| CoreError::Radio(e.to_string()))?;
 
-        Ok(Self { tx, running, seq, identity, peers, inbox, worker: Some(worker) })
+        Ok(Self {
+            tx,
+            running,
+            seq,
+            identity,
+            peers,
+            inbox,
+            outbox_len,
+            worker: Some(worker),
+        })
     }
 
     pub fn public_key(&self) -> PeerId {
@@ -224,16 +267,26 @@ impl MeshCore {
         self.running.load(Ordering::Acquire)
     }
 
+    /// Number of directed messages awaiting an ack.
+    pub fn outbox_len(&self) -> u64 {
+        self.outbox_len.load(Ordering::Relaxed)
+    }
+
     pub fn start_broadcasting(&self) -> Result<(), CoreError> {
-        self.tx.send(Command::Start).map_err(|_| CoreError::NotRunning)
+        self.tx
+            .send(Command::Start)
+            .map_err(|_| CoreError::NotRunning)
     }
 
     pub fn stop_broadcasting(&self) -> Result<(), CoreError> {
-        self.tx.send(Command::Stop).map_err(|_| CoreError::NotRunning)
+        self.tx
+            .send(Command::Stop)
+            .map_err(|_| CoreError::NotRunning)
     }
 
     /// Queue a message. Returns the 16-byte message id immediately; delivery is
-    /// reported later as a `MessageDelivered` event. `to == None` broadcasts.
+    /// reported later as a `MessageDelivered` (or `MessageExpired`) event.
+    /// `to == None` broadcasts.
     pub fn send_message(&self, to: Option<PeerId>, body: &[u8]) -> Result<[u8; 16], CoreError> {
         if body.is_empty() {
             return Err(CoreError::InvalidArgument("empty body"));
@@ -243,7 +296,11 @@ impl MeshCore {
         }
         let msg_id = crypto::random_16()?;
         self.tx
-            .send(Command::Send { to, body: body.to_vec(), msg_id })
+            .send(Command::Send {
+                to,
+                body: body.to_vec(),
+                msg_id,
+            })
             .map_err(|_| CoreError::NotRunning)?;
         Ok(msg_id)
     }
@@ -258,7 +315,10 @@ impl MeshCore {
             return Err(CoreError::InvalidArgument("advertisement length"));
         }
         self.tx
-            .send(Command::Ingest { rssi, bytes: bytes.to_vec() })
+            .send(Command::Ingest {
+                rssi,
+                bytes: bytes.to_vec(),
+            })
             .map_err(|_| CoreError::NotRunning)
     }
 
@@ -272,7 +332,10 @@ impl MeshCore {
     }
 
     pub fn peers(&self) -> Vec<Peer> {
-        self.peers.lock().map(|p| p.values().cloned().collect()).unwrap_or_default()
+        self.peers
+            .lock()
+            .map(|p| p.values().cloned().collect())
+            .unwrap_or_default()
     }
 
     pub fn next_seq(&self) -> u32 {
@@ -299,14 +362,20 @@ impl Drop for MeshCore {
 struct Worker {
     config: Config,
     identity: Identity,
+    epoch: u64,
+    counter: u64,
     radio: Arc<dyn PlatformRadio>,
     sink: Arc<dyn EventSink>,
     running: Arc<AtomicBool>,
     seq: Arc<AtomicU32>,
     peers: Arc<Mutex<HashMap<PeerId, Peer>>>,
     inbox: Arc<Mutex<VecDeque<Event>>>,
+    outbox: Outbox,
+    outbox_len: Arc<AtomicU64>,
+    replay: HashMap<PeerId, ReplayWindow>,
     seen: VecDeque<[u8; 16]>,
     seen_set: HashMap<[u8; 16], u64>,
+    last_beacon_ms: u64,
 }
 
 impl Worker {
@@ -337,11 +406,18 @@ impl Worker {
         }
     }
 
+    /// Consume the next per-session counter. Every sealed frame gets a distinct
+    /// one, which is what the recipient's replay window keys off.
+    fn next_counter(&mut self) -> u64 {
+        let c = self.counter;
+        self.counter += 1;
+        c
+    }
+
     fn do_start(&mut self) -> Result<(), CoreError> {
-        let beacon = frame::build_beacon(&self.identity, &self.config.nickname)?;
-        self.radio.start_advertising(&beacon)?;
         self.radio.start_scanning()?;
         self.running.store(true, Ordering::Release);
+        self.send_beacon()?;
         self.emit(Event::transport_state(self.tick_seq(), true));
         Ok(())
     }
@@ -351,6 +427,27 @@ impl Worker {
         self.radio.stop_scanning()?;
         self.running.store(false, Ordering::Release);
         self.emit(Event::transport_state(self.tick_seq(), false));
+        Ok(())
+    }
+
+    fn send_beacon(&mut self) -> Result<(), CoreError> {
+        let counter = self.next_counter();
+        let nickname = self.config.nickname.clone();
+        let wire = frame::build(
+            &self.identity,
+            &frame::Outgoing {
+                recipient: crypto::BROADCAST_ID,
+                msg_id: crypto::random_16()?,
+                epoch: self.epoch,
+                counter,
+                ttl: 1, // a beacon describes us; it is never relayed
+                body: b"",
+                nickname: &nickname,
+                kind: FrameKind::Beacon,
+            },
+        )?;
+        self.radio.start_advertising(&wire)?;
+        self.last_beacon_ms = now_ms();
         Ok(())
     }
 
@@ -364,20 +461,55 @@ impl Worker {
             return Err(CoreError::NotRunning);
         }
         let recipient = to.unwrap_or(crypto::BROADCAST_ID);
-        let wire = frame::seal(&self.identity, &recipient, msg_id, self.config.ttl, body)?;
+        let counter = self.next_counter();
+        let wire = frame::build(
+            &self.identity,
+            &frame::Outgoing {
+                recipient,
+                msg_id,
+                epoch: self.epoch,
+                counter,
+                ttl: self.config.ttl,
+                body,
+                nickname: "",
+                kind: FrameKind::Message,
+            },
+        )?;
 
         // Mark our own id as seen so a neighbour's re-flood does not loop back.
         self.remember(msg_id);
+        self.transmit(&recipient, &wire);
 
-        let delivered = match to {
-            Some(peer) => self.radio.send_direct(&peer, &wire).is_ok(),
-            None => false,
-        };
-        if !delivered {
-            self.radio.start_advertising(&wire)?; // flood
+        match to {
+            Some(peer) => {
+                // Directed: hold it until the recipient acks. This is the
+                // store-and-forward half — see outbox.rs.
+                if let Some(dropped) = self.outbox.push(msg_id, peer, wire, now_ms()) {
+                    self.emit(Event::message_expired(
+                        self.tick_seq(),
+                        dropped,
+                        "outbox full",
+                    ));
+                }
+                self.sync_outbox_len();
+            }
+            None => {
+                // Broadcast has no single recipient to ack, so "on the air" is
+                // the only delivery signal that exists.
+                self.emit(Event::message_delivered(self.tick_seq(), msg_id, false));
+            }
         }
-        self.emit(Event::message_delivered(self.tick_seq(), msg_id, delivered));
         Ok(())
+    }
+
+    /// Put a frame on the air, preferring a GATT connection when we have one.
+    /// Returns true if it went out directly rather than by flooding.
+    fn transmit(&self, recipient: &PeerId, wire: &[u8]) -> bool {
+        if *recipient != crypto::BROADCAST_ID && self.radio.send_direct(recipient, wire).is_ok() {
+            return true;
+        }
+        let _ = self.radio.start_advertising(wire);
+        false
     }
 
     fn do_ingest(&mut self, rssi: i8, bytes: &[u8]) -> Result<(), CoreError> {
@@ -388,38 +520,31 @@ impl Worker {
             return Ok(());
         }
 
-        // 2. Peer table refresh happens for every valid frame, beacon or not.
-        self.touch_peer(parsed.sender, parsed.nickname.clone(), rssi, parsed.hops);
-
-        if parsed.is_beacon {
+        // Never process our own re-flood as if it were someone else's frame.
+        if parsed.sender == self.identity.public_id() {
             return Ok(());
         }
 
-        // 3. Only try to decrypt frames addressed to us or broadcast.
-        let for_us =
-            parsed.recipient == self.identity.public_id() || parsed.recipient == crypto::BROADCAST_ID;
+        let for_us = parsed.recipient == self.identity.public_id() || parsed.is_broadcast();
 
+        // 2. Only frames we can authenticate get to touch any state. A directed
+        //    frame for someone else is relayed unopened at step 4.
         if for_us {
             match frame::open(&self.identity, &parsed) {
-                Ok(plaintext) => {
-                    let ev = Event::message_received(
-                        self.tick_seq(),
-                        parsed.sender,
-                        parsed.msg_id,
-                        parsed.ttl,
-                        parsed.hops,
-                        rssi,
-                        plaintext,
-                    );
-                    self.push_inbox(ev.clone());
-                    self.emit(ev);
+                Ok(plaintext) => self.accept(&parsed, plaintext, rssi)?,
+                Err(e) => {
+                    // The air is full of other people's traffic; only surface
+                    // failures on frames that were addressed to us specifically.
+                    if !parsed.is_broadcast() {
+                        self.emit(Event::error(self.tick_seq(), &e.to_string()));
+                    }
                 }
-                Err(e) => self.emit(Event::error(self.tick_seq(), &e.to_string())),
             }
         }
 
-        // 4. Relay: decrement TTL and re-flood regardless of whether it was for
-        //    us (broadcast) or not (we are a relay). This is what makes a mesh.
+        // 3. Relay: decrement TTL and re-flood. Done for frames not addressed
+        //    to us (we are a relay) and for broadcasts (we are a repeater).
+        //    Note this happens without a key — that is the point of a mesh.
         if parsed.ttl > 1 && parsed.recipient != self.identity.public_id() {
             let relayed = frame::relay(bytes)?;
             let _ = self.radio.start_advertising(&relayed);
@@ -427,8 +552,93 @@ impl Worker {
         Ok(())
     }
 
+    /// Handle a frame whose AEAD has verified.
+    ///
+    /// The replay check lives here, *after* verification, deliberately: checking
+    /// before would let an attacker spray forged counters and lock out the real
+    /// sender, converting a replay defence into a denial of service.
+    fn accept(
+        &mut self,
+        parsed: &ParsedFrame<'_>,
+        plaintext: Vec<u8>,
+        rssi: i8,
+    ) -> Result<(), CoreError> {
+        let verdict = match self.replay.get_mut(&parsed.sender) {
+            Some(w) => w.admit(parsed.epoch, parsed.counter),
+            None => {
+                self.replay.insert(
+                    parsed.sender,
+                    ReplayWindow::new(parsed.epoch, parsed.counter),
+                );
+                ReplayVerdict::Fresh
+            }
+        };
+        if verdict != ReplayVerdict::Fresh {
+            // Silent drop: a replay is an attack or a stale relay, and neither
+            // is worth waking the UI for.
+            return Ok(());
+        }
+
+        // Verified and fresh, so this peer is real and reachable.
+        self.touch_peer(parsed.sender, parsed.nickname.clone(), rssi, parsed.hops);
+
+        match parsed.kind {
+            FrameKind::Beacon => {}
+            FrameKind::Ack => {
+                if plaintext.len() == 16 {
+                    let mut acked = [0u8; 16];
+                    acked.copy_from_slice(&plaintext);
+                    if self.outbox.ack(&acked) {
+                        self.sync_outbox_len();
+                        self.emit(Event::message_delivered(self.tick_seq(), acked, true));
+                    }
+                }
+            }
+            FrameKind::Message => {
+                let ev = Event::message_received(
+                    self.tick_seq(),
+                    parsed.sender,
+                    parsed.msg_id,
+                    parsed.ttl,
+                    parsed.hops,
+                    rssi,
+                    plaintext,
+                );
+                self.push_inbox(ev.clone());
+                self.emit(ev);
+
+                // Only directed messages are acked — a broadcast would draw an
+                // ack from every listener at once.
+                if !parsed.is_broadcast() {
+                    self.send_ack(&parsed.sender, parsed.msg_id)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn send_ack(&mut self, to: &PeerId, acked: [u8; 16]) -> Result<(), CoreError> {
+        let counter = self.next_counter();
+        let wire = frame::build(
+            &self.identity,
+            &frame::Outgoing {
+                recipient: *to,
+                msg_id: crypto::random_16()?,
+                epoch: self.epoch,
+                counter,
+                ttl: self.config.ttl,
+                body: &acked,
+                nickname: "",
+                kind: FrameKind::Ack,
+            },
+        )?;
+        self.transmit(to, &wire);
+        Ok(())
+    }
+
     fn tick(&mut self) {
         let now = now_ms();
+
         // Expire stale peers.
         let mut gone = Vec::new();
         if let Ok(mut peers) = self.peers.lock() {
@@ -443,6 +653,39 @@ impl Worker {
         for id in gone {
             self.emit(Event::peer_lost(self.tick_seq(), id));
         }
+
+        if !self.running.load(Ordering::Acquire) {
+            return;
+        }
+
+        // Retransmit and expire.
+        for item in self.outbox.take_due(now) {
+            match item.due {
+                outbox::Due::Retry(wire) => {
+                    self.transmit(&item.recipient, &wire);
+                }
+                outbox::Due::Expired => {
+                    self.emit(Event::message_expired(
+                        self.tick_seq(),
+                        item.msg_id,
+                        "no ack",
+                    ));
+                }
+            }
+        }
+        self.sync_outbox_len();
+
+        // Re-beacon so peers that arrive mid-session still find us.
+        if now.saturating_sub(self.last_beacon_ms) >= BEACON_INTERVAL_MS {
+            if let Err(e) = self.send_beacon() {
+                self.emit(Event::error(self.tick_seq(), &e.to_string()));
+            }
+        }
+    }
+
+    fn sync_outbox_len(&self) {
+        self.outbox_len
+            .store(self.outbox.len() as u64, Ordering::Relaxed);
     }
 
     /// Returns `true` if we had already seen this id.
@@ -465,7 +708,13 @@ impl Worker {
         if let Ok(mut peers) = self.peers.lock() {
             let entry = peers.entry(id).or_insert_with(|| {
                 is_new = true;
-                Peer { id, nickname: nickname.clone(), rssi, last_seen_ms: 0, hops }
+                Peer {
+                    id,
+                    nickname: nickname.clone(),
+                    rssi,
+                    last_seen_ms: 0,
+                    hops,
+                }
             });
             entry.rssi = rssi;
             entry.hops = hops;
@@ -475,14 +724,38 @@ impl Worker {
             }
         }
         if is_new {
-            self.emit(Event::peer_discovered(self.tick_seq(), id, &nickname, rssi, hops));
+            self.emit(Event::peer_discovered(
+                self.tick_seq(),
+                id,
+                &nickname,
+                rssi,
+                hops,
+            ));
+            // Anything queued for this peer becomes due right now. This is what
+            // makes "walks back into range" feel instant instead of waiting out
+            // an exponential backoff.
+            if self.outbox.wake_for_peer(&id, now_ms()) > 0 {
+                self.flush_woken(&id);
+            }
+        }
+    }
+
+    fn flush_woken(&mut self, peer: &PeerId) {
+        let now = now_ms();
+        for item in self.outbox.take_due(now) {
+            if item.recipient != *peer {
+                continue; // another peer's entry that happened to also be due
+            }
+            if let outbox::Due::Retry(wire) = item.due {
+                self.transmit(peer, &wire);
+            }
         }
     }
 
     fn push_inbox(&self, ev: Event) {
         if let Ok(mut inbox) = self.inbox.lock() {
             // Bounded: if JS never drains, drop oldest rather than grow forever.
-            if inbox.len() >= 256 {
+            if inbox.len() >= INBOX_CAPACITY {
                 inbox.pop_front();
             }
             inbox.push_back(ev);
@@ -499,7 +772,10 @@ impl Worker {
 }
 
 pub fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -513,7 +789,15 @@ mod tests {
     #[derive(Default)]
     struct NullRadio {
         sent: Mutex<Vec<Vec<u8>>>,
+        direct_ok: AtomicBool,
     }
+
+    impl NullRadio {
+        fn drain(&self) -> Vec<Vec<u8>> {
+            std::mem::take(&mut *self.sent.lock().unwrap())
+        }
+    }
+
     impl PlatformRadio for NullRadio {
         fn start_advertising(&self, p: &[u8]) -> Result<(), CoreError> {
             self.sent.lock().unwrap().push(p.to_vec());
@@ -528,8 +812,13 @@ mod tests {
         fn stop_scanning(&self) -> Result<(), CoreError> {
             Ok(())
         }
-        fn send_direct(&self, _: &PeerId, _: &[u8]) -> Result<(), CoreError> {
-            Err(CoreError::UnknownPeer)
+        fn send_direct(&self, _: &PeerId, p: &[u8]) -> Result<(), CoreError> {
+            if self.direct_ok.load(Ordering::Relaxed) {
+                self.sent.lock().unwrap().push(p.to_vec());
+                Ok(())
+            } else {
+                Err(CoreError::UnknownPeer)
+            }
         }
     }
 
@@ -537,84 +826,361 @@ mod tests {
     struct CollectSink {
         events: Mutex<Vec<Event>>,
     }
+
+    impl CollectSink {
+        fn kinds(&self) -> Vec<u8> {
+            self.events
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|e| e.kind_tag())
+                .collect()
+        }
+        fn bodies(&self) -> Vec<Vec<u8>> {
+            self.events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|e| match &e.kind {
+                    EventKind::MessageReceived { body, .. } => Some(body.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+        fn count(&self, tag: u8) -> usize {
+            self.kinds().iter().filter(|k| **k == tag).count()
+        }
+    }
+
     impl EventSink for CollectSink {
         fn emit(&self, e: Event) {
             self.events.lock().unwrap().push(e);
         }
     }
 
+    struct Node {
+        core: MeshCore,
+        radio: Arc<NullRadio>,
+        sink: Arc<CollectSink>,
+    }
+
+    fn node(nickname: &str, seed: u8) -> Node {
+        let radio = Arc::new(NullRadio::default());
+        let sink = Arc::new(CollectSink::default());
+        let core = MeshCore::new(
+            Config {
+                nickname: nickname.into(),
+                identity_seed: Some([seed; 32]),
+                ttl: 4,
+                epoch: Some(1),
+            },
+            radio.clone(),
+            sink.clone(),
+        )
+        .unwrap();
+        Node { core, radio, sink }
+    }
+
+    fn settle() {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    /// Hand everything `from` put on the air to `to`, as a radio would.
+    fn deliver(from: &Node, to: &Node) {
+        for wire in from.radio.drain() {
+            to.core.ingest(-55, &wire).unwrap();
+        }
+        settle();
+    }
+
     #[test]
     fn roundtrip_broadcast_between_two_cores() {
-        let radio_a = Arc::new(NullRadio::default());
-        let sink_a = Arc::new(CollectSink::default());
-        let a = MeshCore::new(
-            Config { nickname: "alice".into(), identity_seed: Some([1u8; 32]), ttl: 4 },
-            radio_a.clone(),
-            sink_a.clone(),
-        )
-        .unwrap();
+        let a = node("alice", 1);
+        let b = node("bob", 2);
+        a.core.start_broadcasting().unwrap();
+        b.core.start_broadcasting().unwrap();
+        settle();
 
-        let radio_b = Arc::new(NullRadio::default());
-        let sink_b = Arc::new(CollectSink::default());
-        let b = MeshCore::new(
-            Config { nickname: "bob".into(), identity_seed: Some([2u8; 32]), ttl: 4 },
-            radio_b.clone(),
-            sink_b.clone(),
-        )
-        .unwrap();
+        a.core.send_message(None, b"hello mesh").unwrap();
+        settle();
+        deliver(&a, &b);
 
-        a.start_broadcasting().unwrap();
-        b.start_broadcasting().unwrap();
-        std::thread::sleep(Duration::from_millis(200));
-
-        a.send_message(None, b"hello mesh").unwrap();
-        std::thread::sleep(Duration::from_millis(200));
-
-        // Hand every byte A put on the air to B, as the radio would.
-        let on_air: Vec<Vec<u8>> = radio_a.sent.lock().unwrap().clone();
-        for wire in on_air {
-            b.ingest(-55, &wire).unwrap();
-        }
-        std::thread::sleep(Duration::from_millis(300));
-
-        let events = sink_b.events.lock().unwrap();
-        let got: Vec<_> = events
-            .iter()
-            .filter_map(|e| match &e.kind {
-                EventKind::MessageReceived { body, .. } => Some(body.clone()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(got, vec![b"hello mesh".to_vec()], "B should decrypt A's broadcast");
-
+        assert_eq!(b.sink.bodies(), vec![b"hello mesh".to_vec()]);
         assert!(
-            events.iter().any(|e| matches!(&e.kind, EventKind::PeerDiscovered { .. })),
-            "B should have discovered A"
+            b.sink.count(event::KIND_PEER_DISCOVERED) >= 1,
+            "B should discover A"
         );
     }
 
     #[test]
     fn duplicate_frames_are_suppressed() {
-        let radio = Arc::new(NullRadio::default());
-        let sink = Arc::new(CollectSink::default());
-        let a = MeshCore::new(Config::default(), radio.clone(), sink.clone()).unwrap();
-        a.start_broadcasting().unwrap();
-        std::thread::sleep(Duration::from_millis(100));
+        let a = node("alice", 1);
+        a.core.start_broadcasting().unwrap();
+        settle();
 
         let sender = Identity::from_seed([9u8; 32]);
-        let wire = frame::seal(&sender, &crypto::BROADCAST_ID, [7u8; 16], 4, b"dup").unwrap();
-        for _ in 0..5 {
-            a.ingest(-40, &wire).unwrap();
-        }
-        std::thread::sleep(Duration::from_millis(300));
+        let wire = frame::build(
+            &sender,
+            &frame::Outgoing {
+                recipient: crypto::BROADCAST_ID,
+                msg_id: [7u8; 16],
+                epoch: 1,
+                counter: 0,
+                ttl: 4,
+                body: b"dup",
+                nickname: "",
+                kind: FrameKind::Message,
+            },
+        )
+        .unwrap();
 
-        let n = sink
-            .events
-            .lock()
+        for _ in 0..5 {
+            a.core.ingest(-40, &wire).unwrap();
+        }
+        settle();
+        assert_eq!(a.sink.count(event::KIND_MESSAGE_RECEIVED), 1);
+    }
+
+    /// The dedup LRU catches identical frames; this catches the same *content*
+    /// re-sealed under a fresh msg_id, which dedup cannot see.
+    #[test]
+    fn a_replayed_counter_is_rejected_even_with_a_fresh_msg_id() {
+        let a = node("alice", 1);
+        a.core.start_broadcasting().unwrap();
+        settle();
+
+        let sender = Identity::from_seed([9u8; 32]);
+        let build = |msg_id: [u8; 16], counter: u64| {
+            frame::build(
+                &sender,
+                &frame::Outgoing {
+                    recipient: crypto::BROADCAST_ID,
+                    msg_id,
+                    epoch: 5,
+                    counter,
+                    ttl: 4,
+                    body: b"transfer $100",
+                    nickname: "",
+                    kind: FrameKind::Message,
+                },
+            )
             .unwrap()
-            .iter()
-            .filter(|e| matches!(&e.kind, EventKind::MessageReceived { .. }))
-            .count();
-        assert_eq!(n, 1, "five copies of one frame must surface exactly once");
+        };
+
+        a.core.ingest(-40, &build([1u8; 16], 0)).unwrap();
+        a.core.ingest(-40, &build([2u8; 16], 1)).unwrap();
+        settle();
+        assert_eq!(a.sink.count(event::KIND_MESSAGE_RECEIVED), 2);
+
+        // Same counters, different msg_ids: the dedup cache sees nothing wrong,
+        // the replay window does.
+        a.core.ingest(-40, &build([3u8; 16], 0)).unwrap();
+        a.core.ingest(-40, &build([4u8; 16], 1)).unwrap();
+        settle();
+        assert_eq!(
+            a.sink.count(event::KIND_MESSAGE_RECEIVED),
+            2,
+            "replayed counters must not be delivered"
+        );
+    }
+
+    #[test]
+    fn a_directed_message_is_acked_and_leaves_the_outbox() {
+        let a = node("alice", 1);
+        let b = node("bob", 2);
+        a.core.start_broadcasting().unwrap();
+        b.core.start_broadcasting().unwrap();
+        settle();
+
+        // Let them see each other first.
+        deliver(&a, &b);
+        deliver(&b, &a);
+
+        let msg_id = a
+            .core
+            .send_message(Some(b.core.public_key()), b"private")
+            .unwrap();
+        settle();
+        assert_eq!(a.core.outbox_len(), 1, "directed message waits for an ack");
+
+        deliver(&a, &b);
+        assert_eq!(b.sink.bodies(), vec![b"private".to_vec()]);
+
+        // B's ack travels back.
+        deliver(&b, &a);
+        assert_eq!(a.core.outbox_len(), 0, "ack must clear the outbox");
+
+        let delivered_direct = a.sink.events.lock().unwrap().iter().any(|e| {
+            matches!(&e.kind, EventKind::MessageDelivered { msg_id: m, direct: true }
+                              if *m == msg_id)
+        });
+        assert!(delivered_direct, "an acked message reports direct delivery");
+    }
+
+    #[test]
+    fn a_broadcast_is_reported_delivered_without_an_ack() {
+        let a = node("alice", 1);
+        a.core.start_broadcasting().unwrap();
+        settle();
+        a.core.send_message(None, b"to everyone").unwrap();
+        settle();
+
+        assert_eq!(a.core.outbox_len(), 0, "broadcasts are not retried");
+        assert_eq!(a.sink.count(event::KIND_MESSAGE_DELIVERED), 1);
+    }
+
+    #[test]
+    fn an_unacked_message_is_retried() {
+        let a = node("alice", 1);
+        let b = node("bob", 2);
+        a.core.start_broadcasting().unwrap();
+        settle();
+
+        a.core
+            .send_message(Some(b.core.public_key()), b"are you there")
+            .unwrap();
+        settle();
+        a.radio.drain(); // discard the first transmission
+
+        // Wait past the first backoff and confirm the frame goes out again.
+        std::thread::sleep(Duration::from_millis(outbox::BASE_BACKOFF_MS + 400));
+        let retried: Vec<_> = a
+            .radio
+            .drain()
+            .into_iter()
+            .filter(|w| {
+                frame::parse(w)
+                    .map(|p| p.kind == FrameKind::Message)
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert!(
+            !retried.is_empty(),
+            "an unacked directed message must be retried"
+        );
+        assert_eq!(a.core.outbox_len(), 1);
+    }
+
+    /// Retries must reuse the original bytes. Re-sealing would burn a counter
+    /// per attempt and punch holes in the recipient's replay window.
+    #[test]
+    fn retries_reuse_the_original_frame() {
+        let a = node("alice", 1);
+        let b = node("bob", 2);
+        a.core.start_broadcasting().unwrap();
+        settle();
+
+        a.core
+            .send_message(Some(b.core.public_key()), b"same bytes")
+            .unwrap();
+        settle();
+        let first: Vec<_> = a
+            .radio
+            .drain()
+            .into_iter()
+            .filter(|w| {
+                frame::parse(w)
+                    .map(|p| p.kind == FrameKind::Message)
+                    .unwrap_or(false)
+            })
+            .collect();
+
+        std::thread::sleep(Duration::from_millis(outbox::BASE_BACKOFF_MS + 400));
+        let second: Vec<_> = a
+            .radio
+            .drain()
+            .into_iter()
+            .filter(|w| {
+                frame::parse(w)
+                    .map(|p| p.kind == FrameKind::Message)
+                    .unwrap_or(false)
+            })
+            .collect();
+
+        assert_eq!(
+            first.first(),
+            second.first(),
+            "retry must be byte-identical"
+        );
+    }
+
+    #[test]
+    fn a_relay_carries_a_frame_it_cannot_read() {
+        let a = node("alice", 1);
+        let relay = node("relay", 2);
+        let c = node("carol", 3);
+        a.core.start_broadcasting().unwrap();
+        relay.core.start_broadcasting().unwrap();
+        c.core.start_broadcasting().unwrap();
+        settle();
+
+        // A sends to C, who is not in range. Only the relay hears it.
+        a.core
+            .send_message(Some(c.core.public_key()), b"two hops")
+            .unwrap();
+        settle();
+        deliver(&a, &relay);
+
+        // The relay cannot decrypt it...
+        assert!(
+            relay.sink.bodies().is_empty(),
+            "relay must not read the payload"
+        );
+        // ...but it re-floods it, and C can.
+        deliver(&relay, &c);
+        assert_eq!(c.sink.bodies(), vec![b"two hops".to_vec()]);
+    }
+
+    #[test]
+    fn our_own_reflooded_frame_is_ignored() {
+        let a = node("alice", 1);
+        a.core.start_broadcasting().unwrap();
+        settle();
+        a.core.send_message(None, b"echo").unwrap();
+        settle();
+
+        // Feed A's own traffic straight back, as a neighbour's relay would.
+        for wire in a.radio.drain() {
+            a.core.ingest(-30, &wire).unwrap();
+        }
+        settle();
+        assert_eq!(a.sink.count(event::KIND_MESSAGE_RECEIVED), 0);
+    }
+
+    #[test]
+    fn a_peer_walking_into_range_flushes_the_queue_immediately() {
+        let a = node("alice", 1);
+        let b = node("bob", 2);
+        a.core.start_broadcasting().unwrap();
+        settle();
+
+        // B is not visible yet, so this queues.
+        a.core
+            .send_message(Some(b.core.public_key()), b"waiting for you")
+            .unwrap();
+        settle();
+        assert_eq!(a.core.outbox_len(), 1);
+        a.radio.drain();
+
+        // B appears. Its beacon should trigger an immediate flush, well inside
+        // the exponential backoff.
+        b.core.start_broadcasting().unwrap();
+        settle();
+        deliver(&b, &a);
+
+        let resent: Vec<_> = a
+            .radio
+            .drain()
+            .into_iter()
+            .filter(|w| {
+                frame::parse(w)
+                    .map(|p| p.kind == FrameKind::Message)
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert!(
+            !resent.is_empty(),
+            "discovering the recipient must flush the queue"
+        );
     }
 }

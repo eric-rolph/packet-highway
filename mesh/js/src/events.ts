@@ -12,7 +12,7 @@
  */
 
 /** Must equal `meshcore::ABI_VERSION`. Asserted at install time. */
-export const MESH_ABI_VERSION = 1;
+export const MESH_ABI_VERSION = 2;
 
 const HEADER_LEN = 16;
 
@@ -23,6 +23,7 @@ export const EventKind = {
   MessageDelivered: 4,
   TransportState: 5,
   Error: 6,
+  MessageExpired: 7,
 } as const;
 
 export type EventKindValue = (typeof EventKind)[keyof typeof EventKind];
@@ -63,6 +64,13 @@ export interface MessageDeliveredEvent extends Base {
   direct: boolean;
 }
 
+export interface MessageExpiredEvent extends Base {
+  type: 'messageExpired';
+  messageId: Uint8Array;
+  /** 'no ack' (deadline hit) or 'outbox full' (evicted). */
+  reason: string;
+}
+
 export interface TransportStateEvent extends Base {
   type: 'transportState';
   running: boolean;
@@ -78,6 +86,7 @@ export type MeshEvent =
   | PeerLostEvent
   | MessageReceivedEvent
   | MessageDeliveredEvent
+  | MessageExpiredEvent
   | TransportStateEvent
   | ErrorEvent;
 
@@ -145,6 +154,15 @@ export function decodeEvent(buffer: ArrayBuffer): MeshEvent {
       const messageId = new Uint8Array(buffer, o, 16);
       o += 16;
       return { ...base, type: 'messageDelivered', messageId, direct: view.getUint8(o) !== 0 };
+    }
+
+    case EventKind.MessageExpired: {
+      const messageId = new Uint8Array(buffer, o, 16);
+      o += 16;
+      const len = view.getUint32(o, true);
+      o += 4;
+      const reason = utf8.decode(new Uint8Array(buffer, o, len));
+      return { ...base, type: 'messageExpired', messageId, reason };
     }
 
     case EventKind.TransportState:

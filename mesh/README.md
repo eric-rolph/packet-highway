@@ -32,8 +32,15 @@ mesh.on('messageReceived', (e) =>
   console.log(peerIdToHex(e.sender), new TextDecoder().decode(e.body)),
 );
 
+// Directed messages are held until acked, retried with backoff, and reported
+// as messageDelivered{direct:true} or messageExpired.
+mesh.on('messageDelivered', (e) => console.log('delivered', e.direct));
+mesh.on('messageExpired', (e) => console.log('gave up:', e.reason));
+
 mesh.start();
-const msgId = mesh.send(null, new TextEncoder().encode('hello mesh')); // broadcast
+mesh.send(null, new TextEncoder().encode('hello mesh')); // broadcast
+mesh.send(peerId, new TextEncoder().encode('just you')); // directed + acked
+console.log(mesh.pendingCount, 'awaiting ack');
 ```
 
 ## Shape
@@ -45,7 +52,8 @@ js/       thin API + binary event decoder
 shared/cpp/   one JSI HostObject, compiled by BOTH platforms
   ↕ C ABI (cbindgen-generated header)
 rust/meshcore-ffi/   the only crate with #[no_mangle]
-rust/meshcore/       pure Rust: framing, X25519+ChaCha20Poly1305, flood routing
+rust/meshcore/       pure Rust: framing, X25519+ChaCha20Poly1305, flood routing,
+                     anti-replay window, store-and-forward outbox
   ↕ PlatformRadio trait (injected)
 ios/MeshRadio.mm     CoreBluetooth
 android/MeshRadio.kt BluetoothLe{Scanner,Advertiser}

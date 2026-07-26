@@ -169,7 +169,10 @@ struct SinkTarget {
 impl SwappableSink {
     fn set(&self, f: MeshEventSink, ctx: *mut c_void) {
         let mut w = self.inner.write().unwrap_or_else(|e| e.into_inner());
-        *w = f.map(|f| SinkTarget { f, ctx: ctx as usize });
+        *w = f.map(|f| SinkTarget {
+            f,
+            ctx: ctx as usize,
+        });
     }
 }
 
@@ -252,19 +255,34 @@ impl CRadio {
 
 impl PlatformRadio for CRadio {
     fn start_advertising(&self, payload: &[u8]) -> Result<(), CoreError> {
-        let f = self.0.start_advertising.ok_or(CoreError::Radio("no start_advertising".into()))?;
-        Self::check(unsafe { f(self.0.ctx, payload.as_ptr(), payload.len()) }, "start_advertising")
+        let f = self
+            .0
+            .start_advertising
+            .ok_or(CoreError::Radio("no start_advertising".into()))?;
+        Self::check(
+            unsafe { f(self.0.ctx, payload.as_ptr(), payload.len()) },
+            "start_advertising",
+        )
     }
     fn stop_advertising(&self) -> Result<(), CoreError> {
-        let f = self.0.stop_advertising.ok_or(CoreError::Radio("no stop_advertising".into()))?;
+        let f = self
+            .0
+            .stop_advertising
+            .ok_or(CoreError::Radio("no stop_advertising".into()))?;
         Self::check(unsafe { f(self.0.ctx) }, "stop_advertising")
     }
     fn start_scanning(&self) -> Result<(), CoreError> {
-        let f = self.0.start_scanning.ok_or(CoreError::Radio("no start_scanning".into()))?;
+        let f = self
+            .0
+            .start_scanning
+            .ok_or(CoreError::Radio("no start_scanning".into()))?;
         Self::check(unsafe { f(self.0.ctx) }, "start_scanning")
     }
     fn stop_scanning(&self) -> Result<(), CoreError> {
-        let f = self.0.stop_scanning.ok_or(CoreError::Radio("no stop_scanning".into()))?;
+        let f = self
+            .0
+            .stop_scanning
+            .ok_or(CoreError::Radio("no stop_scanning".into()))?;
         Self::check(unsafe { f(self.0.ctx) }, "stop_scanning")
     }
     fn send_direct(&self, peer: &PeerId, payload: &[u8]) -> Result<(), CoreError> {
@@ -352,6 +370,9 @@ pub unsafe extern "C" fn mesh_core_new(
             nickname,
             identity_seed,
             ttl: if cfg.ttl == 0 { 6 } else { cfg.ttl },
+            // None => wall clock at construction. Pass a persisted boot counter
+            // via MeshConfig once identity storage lands; see replay.rs.
+            epoch: None,
         };
 
         match MeshHandle::new_internal(core_cfg, Arc::new(CRadio(radio))) {
@@ -375,9 +396,7 @@ pub unsafe extern "C" fn mesh_core_free(handle: *mut MeshHandle) {
     if handle.is_null() {
         return;
     }
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        drop(Box::from_raw(handle))
-    }));
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(Box::from_raw(handle))));
 }
 
 /// Register (or clear, with `sink == NULL`) the async event callback.
@@ -447,6 +466,21 @@ pub unsafe extern "C" fn mesh_is_running(handle: *mut MeshHandle) -> bool {
     match handle.as_ref() {
         Some(h) => h.core.is_running(),
         None => false,
+    }
+}
+
+/// Number of directed messages queued awaiting an ack.
+///
+/// Cheap: a relaxed atomic load, no lock and no round trip to the worker
+/// thread, so a UI can poll it per frame if it wants a "3 pending" badge.
+///
+/// # Safety
+/// `handle` must be live.
+#[no_mangle]
+pub unsafe extern "C" fn mesh_outbox_len(handle: *mut MeshHandle) -> u64 {
+    match handle.as_ref() {
+        Some(h) => h.core.outbox_len(),
+        None => 0,
     }
 }
 
@@ -650,7 +684,10 @@ mod tests {
             );
 
             let mut pk = [0u8; 32];
-            assert_eq!(mesh_core_public_key(handle, pk.as_mut_ptr()), MeshStatus::Ok);
+            assert_eq!(
+                mesh_core_public_key(handle, pk.as_mut_ptr()),
+                MeshStatus::Ok
+            );
             assert_ne!(pk, [0u8; 32]);
 
             assert_eq!(mesh_start_broadcasting(handle), MeshStatus::Ok);
@@ -672,12 +709,18 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(200));
 
             assert!(ADV_CALLS.load(Ordering::SeqCst) >= 2, "beacon + message");
-            assert!(SINK_CALLS.load(Ordering::SeqCst) >= 2, "transport state + delivered");
+            assert!(
+                SINK_CALLS.load(Ordering::SeqCst) >= 2,
+                "transport state + delivered"
+            );
             assert!(SINK_BYTES.load(Ordering::SeqCst) > 0);
 
             let mut peers = MeshBuffer::empty();
             assert_eq!(mesh_peers(handle, &mut peers), MeshStatus::Ok);
-            assert_eq!(u32::from_le_bytes(peers.into_vec()[..4].try_into().unwrap()), 0);
+            assert_eq!(
+                u32::from_le_bytes(peers.into_vec()[..4].try_into().unwrap()),
+                0
+            );
 
             assert_eq!(mesh_stop_broadcasting(handle), MeshStatus::Ok);
             std::thread::sleep(std::time::Duration::from_millis(150));
@@ -689,8 +732,14 @@ mod tests {
     fn every_entry_point_survives_null() {
         unsafe {
             let mut out = MeshBuffer::empty();
-            assert_eq!(mesh_start_broadcasting(std::ptr::null_mut()), MeshStatus::NullHandle);
-            assert_eq!(mesh_stop_broadcasting(std::ptr::null_mut()), MeshStatus::NullHandle);
+            assert_eq!(
+                mesh_start_broadcasting(std::ptr::null_mut()),
+                MeshStatus::NullHandle
+            );
+            assert_eq!(
+                mesh_stop_broadcasting(std::ptr::null_mut()),
+                MeshStatus::NullHandle
+            );
             assert_eq!(
                 mesh_core_public_key(std::ptr::null_mut(), std::ptr::null_mut()),
                 MeshStatus::NullHandle
@@ -704,8 +753,10 @@ mod tests {
                 MeshStatus::NullHandle
             );
             assert!(!mesh_is_running(std::ptr::null_mut()));
-            assert_eq!(mesh_core_new(std::ptr::null(), vtable(), std::ptr::null_mut()),
-                MeshStatus::InvalidArgument);
+            assert_eq!(
+                mesh_core_new(std::ptr::null(), vtable(), std::ptr::null_mut()),
+                MeshStatus::InvalidArgument
+            );
             mesh_core_free(std::ptr::null_mut()); // must not crash
         }
     }
