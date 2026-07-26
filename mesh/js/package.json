@@ -1,0 +1,39 @@
+{
+  "name": "react-native-meshcore",
+  "version": "0.1.0",
+  "description": "Rust-powered serverless P2P mesh messaging for React Native (JSI + Turbo Module)",
+  "license": "MIT",
+  "author": "",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "files": [
+    "src",
+    "../ios",
+    "../android",
+    "../shared",
+    "../rust"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build:ios": "bash ../scripts/build-ios.sh",
+    "build:android": "bash ../scripts/build-android.sh",
+    "test:rust": "cargo test --manifest-path ../rust/Cargo.toml"
+  },
+  "peerDependencies": {
+    "react": "*",
+    "react-native": ">=0.72.0"
+  },
+  "devDependencies": {
+    "@types/react": "^18.2.0",
+    "react-native": "^0.76.0",
+    "typescript": "^5.4.0"
+  },
+  "codegenConfig": {
+    "name": "RNMeshCoreSpec",
+    "type": "modules",
+    "jsSrcsDir": "src",
+    "android": {
+      "javaPackageName": "com.meshcore"
+    }
+  }
+}
