@@ -34,18 +34,20 @@ pub mod crypto;
 pub mod event;
 pub mod frame;
 pub mod outbox;
+pub mod prekey;
 pub mod replay;
 
 pub use crypto::{Identity, PeerId};
 pub use event::{Event, EventKind};
 pub use frame::{FrameError, FrameKind, ParsedFrame};
 pub use outbox::Outbox;
+pub use prekey::{PeerPrekey, PrekeyRing};
 pub use replay::{ReplayVerdict, ReplayWindow};
 
 /// Bumped whenever the C ABI or the binary event layout changes. The native
 /// layer asserts this at install time so a stale `.so` can never silently
 /// mis-decode events.
-pub const ABI_VERSION: u32 = 2;
+pub const ABI_VERSION: u32 = 3;
 
 /// Max hops a flooded frame may take before it is dropped.
 const DEFAULT_TTL: u8 = 6;
@@ -232,6 +234,8 @@ impl MeshCore {
             inbox: inbox.clone(),
             outbox: Outbox::default(),
             outbox_len: outbox_len.clone(),
+            prekeys: PrekeyRing::new(now_ms())?,
+            peer_prekeys: HashMap::new(),
             replay: HashMap::new(),
             seen: VecDeque::with_capacity(DEDUP_CAPACITY),
             seen_set: HashMap::new(),
@@ -372,6 +376,10 @@ struct Worker {
     inbox: Arc<Mutex<VecDeque<Event>>>,
     outbox: Outbox,
     outbox_len: Arc<AtomicU64>,
+    /// Our own rotating prekeys — the forward-secrecy ring.
+    prekeys: PrekeyRing,
+    /// Prekeys advertised by peers, after signature verification.
+    peer_prekeys: HashMap<PeerId, PeerPrekey>,
     replay: HashMap<PeerId, ReplayWindow>,
     seen: VecDeque<[u8; 16]>,
     seen_set: HashMap<[u8; 16], u64>,
@@ -430,9 +438,13 @@ impl Worker {
         Ok(())
     }
 
+    /// The beacon does double duty: it announces us to neighbours *and*
+    /// publishes the signed prekey they need to send us forward-secret mail.
+    /// Bundling them means forward secrecy costs no extra traffic.
     fn send_beacon(&mut self) -> Result<(), CoreError> {
         let counter = self.next_counter();
         let nickname = self.config.nickname.clone();
+        let bundle = self.prekeys.bundle(&self.identity);
         let wire = frame::build(
             &self.identity,
             &frame::Outgoing {
@@ -441,9 +453,10 @@ impl Worker {
                 epoch: self.epoch,
                 counter,
                 ttl: 1, // a beacon describes us; it is never relayed
-                body: b"",
+                body: &bundle,
                 nickname: &nickname,
                 kind: FrameKind::Beacon,
+                sealing: frame::Sealing::Network,
             },
         )?;
         self.radio.start_advertising(&wire)?;
@@ -461,20 +474,7 @@ impl Worker {
             return Err(CoreError::NotRunning);
         }
         let recipient = to.unwrap_or(crypto::BROADCAST_ID);
-        let counter = self.next_counter();
-        let wire = frame::build(
-            &self.identity,
-            &frame::Outgoing {
-                recipient,
-                msg_id,
-                epoch: self.epoch,
-                counter,
-                ttl: self.config.ttl,
-                body,
-                nickname: "",
-                kind: FrameKind::Message,
-            },
-        )?;
+        let wire = self.seal(recipient, msg_id, body, FrameKind::Message)?;
 
         // Mark our own id as seen so a neighbour's re-flood does not loop back.
         self.remember(msg_id);
@@ -500,6 +500,61 @@ impl Worker {
             }
         }
         Ok(())
+    }
+
+    /// Seal a frame, choosing the strongest key agreement available.
+    ///
+    /// Broadcasts use the group key. Directed frames use the forward-secret
+    /// path when we hold a verified prekey for the recipient, and fall back to
+    /// static-static when we do not — sending something the recipient can read
+    /// beats refusing, and the receiver is told which it got so the UI need not
+    /// imply a guarantee that is absent.
+    ///
+    /// A message queued before we learned the recipient's prekey keeps the
+    /// fallback sealing for its retries: the outbox stores sealed bytes on
+    /// purpose (re-sealing would burn replay counters), so the upgrade only
+    /// applies to messages sent after the beacon arrives.
+    fn seal(
+        &mut self,
+        recipient: PeerId,
+        msg_id: [u8; 16],
+        body: &[u8],
+        kind: FrameKind,
+    ) -> Result<Vec<u8>, CoreError> {
+        let counter = self.next_counter();
+        let mut out = frame::Outgoing {
+            recipient,
+            msg_id,
+            epoch: self.epoch,
+            counter,
+            ttl: self.config.ttl,
+            body,
+            nickname: "",
+            kind,
+            sealing: frame::Sealing::Network,
+        };
+
+        if recipient == crypto::BROADCAST_ID {
+            return frame::build(&self.identity, &out);
+        }
+
+        match self.peer_prekeys.get(&recipient).copied() {
+            Some(prekey) => {
+                // Fresh per message. It is dropped — and zeroized — when this
+                // scope ends, which is the step that makes the frame forward
+                // secret rather than merely encrypted.
+                let ephemeral = crypto::random_secret()?;
+                out.sealing = frame::Sealing::ForwardSecret {
+                    ephemeral: &ephemeral,
+                    prekey: &prekey,
+                };
+                frame::build(&self.identity, &out)
+            }
+            None => {
+                out.sealing = frame::Sealing::Static;
+                frame::build(&self.identity, &out)
+            }
+        }
     }
 
     /// Put a frame on the air, preferring a GATT connection when we have one.
@@ -530,7 +585,7 @@ impl Worker {
         // 2. Only frames we can authenticate get to touch any state. A directed
         //    frame for someone else is relayed unopened at step 4.
         if for_us {
-            match frame::open(&self.identity, &parsed) {
+            match self.unseal(&parsed) {
                 Ok(plaintext) => self.accept(&parsed, plaintext, rssi)?,
                 Err(e) => {
                     // The air is full of other people's traffic; only surface
@@ -550,6 +605,36 @@ impl Worker {
             let _ = self.radio.start_advertising(&relayed);
         }
         Ok(())
+    }
+
+    /// Pick the opening key that matches how the sender sealed the frame.
+    ///
+    /// The choice is driven entirely by authenticated header bits, so an
+    /// attacker cannot downgrade us onto a weaker key: flipping `FLAG_FS` or
+    /// the prekey generation changes the AAD and the AEAD fails.
+    fn unseal(&self, parsed: &ParsedFrame<'_>) -> Result<Vec<u8>, CoreError> {
+        if parsed.is_broadcast() {
+            return frame::open(&self.identity, parsed, frame::Opening::Network);
+        }
+        match &parsed.fs {
+            Some(fs) => {
+                // A generation we no longer hold means the prekey has been
+                // rotated out. The message is unrecoverable — that is the
+                // forward-secrecy guarantee working, not a failure to handle.
+                let prekey = self
+                    .prekeys
+                    .get(fs.generation)
+                    .ok_or(CoreError::Crypto("prekey generation expired"))?;
+                frame::open(
+                    &self.identity,
+                    parsed,
+                    frame::Opening::ForwardSecret {
+                        prekey_secret: prekey.secret(),
+                    },
+                )
+            }
+            None => frame::open(&self.identity, parsed, frame::Opening::Static),
+        }
     }
 
     /// Handle a frame whose AEAD has verified.
@@ -583,7 +668,27 @@ impl Worker {
         self.touch_peer(parsed.sender, parsed.nickname.clone(), rssi, parsed.hops);
 
         match parsed.kind {
-            FrameKind::Beacon => {}
+            FrameKind::Beacon => {
+                // The bundle is signature-checked against the sender's Ed25519
+                // id inside parse_bundle, so a mesh member cannot advertise a
+                // prekey under someone else's name and collect their mail.
+                if let Some(bundle) = prekey::parse_bundle(&parsed.sender, &plaintext) {
+                    let entry = self.peer_prekeys.entry(parsed.sender);
+                    match entry {
+                        std::collections::hash_map::Entry::Occupied(mut o) => {
+                            // Only move forward. Accepting an older generation
+                            // would let a captured beacon pin a peer to a
+                            // prekey whose secret is closer to expiry.
+                            if bundle.generation > o.get().generation {
+                                o.insert(bundle);
+                            }
+                        }
+                        std::collections::hash_map::Entry::Vacant(v) => {
+                            v.insert(bundle);
+                        }
+                    }
+                }
+            }
             FrameKind::Ack => {
                 if plaintext.len() == 16 {
                     let mut acked = [0u8; 16];
@@ -597,12 +702,15 @@ impl Worker {
             FrameKind::Message => {
                 let ev = Event::message_received(
                     self.tick_seq(),
-                    parsed.sender,
-                    parsed.msg_id,
-                    parsed.ttl,
-                    parsed.hops,
-                    rssi,
-                    plaintext,
+                    event::ReceivedMessage {
+                        sender: parsed.sender,
+                        msg_id: parsed.msg_id,
+                        ttl: parsed.ttl,
+                        hops: parsed.hops,
+                        rssi,
+                        forward_secret: parsed.is_forward_secret(),
+                        body: plaintext,
+                    },
                 );
                 self.push_inbox(ev.clone());
                 self.emit(ev);
@@ -618,20 +726,7 @@ impl Worker {
     }
 
     fn send_ack(&mut self, to: &PeerId, acked: [u8; 16]) -> Result<(), CoreError> {
-        let counter = self.next_counter();
-        let wire = frame::build(
-            &self.identity,
-            &frame::Outgoing {
-                recipient: *to,
-                msg_id: crypto::random_16()?,
-                epoch: self.epoch,
-                counter,
-                ttl: self.config.ttl,
-                body: &acked,
-                nickname: "",
-                kind: FrameKind::Ack,
-            },
-        )?;
+        let wire = self.seal(*to, crypto::random_16()?, &acked, FrameKind::Ack)?;
         self.transmit(to, &wire);
         Ok(())
     }
@@ -675,8 +770,19 @@ impl Worker {
         }
         self.sync_outbox_len();
 
+        // Rotating retires the prekey peers are currently addressing, so the
+        // beacon has to go out immediately — otherwise senders keep using a
+        // generation we are counting down to destroying.
+        let rotated = match self.prekeys.rotate_if_due(now) {
+            Ok(r) => r,
+            Err(e) => {
+                self.emit(Event::error(self.tick_seq(), &e.to_string()));
+                false
+            }
+        };
+
         // Re-beacon so peers that arrive mid-session still find us.
-        if now.saturating_sub(self.last_beacon_ms) >= BEACON_INTERVAL_MS {
+        if rotated || now.saturating_sub(self.last_beacon_ms) >= BEACON_INTERVAL_MS {
             if let Err(e) = self.send_beacon() {
                 self.emit(Event::error(self.tick_seq(), &e.to_string()));
             }
@@ -847,6 +953,19 @@ mod tests {
                 })
                 .collect()
         }
+        /// Forward-secrecy flag of each received message, in arrival order.
+        fn fs_flags(&self) -> Vec<bool> {
+            self.events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|e| match &e.kind {
+                    EventKind::MessageReceived { forward_secret, .. } => Some(*forward_secret),
+                    _ => None,
+                })
+                .collect()
+        }
+
         fn count(&self, tag: u8) -> usize {
             self.kinds().iter().filter(|k| **k == tag).count()
         }
@@ -930,6 +1049,7 @@ mod tests {
                 body: b"dup",
                 nickname: "",
                 kind: FrameKind::Message,
+                sealing: frame::Sealing::Network,
             },
         )
         .unwrap();
@@ -962,6 +1082,7 @@ mod tests {
                     body: b"transfer $100",
                     nickname: "",
                     kind: FrameKind::Message,
+                    sealing: frame::Sealing::Network,
                 },
             )
             .unwrap()
@@ -1101,6 +1222,130 @@ mod tests {
             first.first(),
             second.first(),
             "retry must be byte-identical"
+        );
+    }
+
+    /// End to end: once B's beacon has taught A its prekey, A's directed
+    /// messages are forward secret and B says so.
+    #[test]
+    fn directed_messages_become_forward_secret_once_the_prekey_is_known() {
+        let a = node("alice", 1);
+        let b = node("bob", 2);
+        a.core.start_broadcasting().unwrap();
+        b.core.start_broadcasting().unwrap();
+        settle();
+
+        // B's beacon carries its signed prekey bundle.
+        deliver(&b, &a);
+
+        a.core
+            .send_message(Some(b.core.public_key()), b"forward secret")
+            .unwrap();
+        settle();
+        deliver(&a, &b);
+
+        assert_eq!(b.sink.bodies(), vec![b"forward secret".to_vec()]);
+        assert_eq!(
+            b.sink.fs_flags(),
+            vec![true],
+            "should have used the prekey path"
+        );
+    }
+
+    /// And when it has not, the message still gets through — but is reported
+    /// honestly as not forward secret rather than silently claiming to be.
+    #[test]
+    fn a_message_to_an_unseen_peer_falls_back_and_admits_it() {
+        let a = node("alice", 1);
+        let b = node("bob", 2);
+        a.core.start_broadcasting().unwrap();
+        b.core.start_broadcasting().unwrap();
+        settle();
+
+        // Deliberately do NOT give A B's beacon: A has no prekey for B.
+        b.radio.drain();
+
+        a.core
+            .send_message(Some(b.core.public_key()), b"no prekey yet")
+            .unwrap();
+        settle();
+        deliver(&a, &b);
+
+        assert_eq!(b.sink.bodies(), vec![b"no prekey yet".to_vec()]);
+        assert_eq!(b.sink.fs_flags(), vec![false], "fallback must not claim FS");
+    }
+
+    /// A broadcast is readable by every member and can never be forward secret;
+    /// the flag has to reflect that rather than defaulting to true.
+    #[test]
+    fn broadcasts_are_never_marked_forward_secret() {
+        let a = node("alice", 1);
+        let b = node("bob", 2);
+        a.core.start_broadcasting().unwrap();
+        b.core.start_broadcasting().unwrap();
+        settle();
+
+        a.core.send_message(None, b"everyone").unwrap();
+        settle();
+        deliver(&a, &b);
+
+        assert_eq!(b.sink.fs_flags(), vec![false]);
+    }
+
+    /// A peer that impersonates another in a beacon must not be able to install
+    /// a prekey under the victim's id — otherwise directed mail to the victim
+    /// would be sealed to a key the attacker holds.
+    #[test]
+    fn a_forged_prekey_bundle_is_not_installed() {
+        let a = node("alice", 1);
+        a.core.start_broadcasting().unwrap();
+        settle();
+
+        let victim = Identity::from_seed([42u8; 32]);
+        let attacker_ring = PrekeyRing::new(0).unwrap();
+        let attacker = Identity::from_seed([43u8; 32]);
+
+        // A beacon that *claims* to be from the victim, but whose bundle is
+        // signed by the attacker. It is sealed with the network key, which the
+        // attacker legitimately holds — the signature is the only thing
+        // standing between them and the victim's mail.
+        let forged_bundle = attacker_ring.bundle(&attacker);
+        let wire = frame::build(
+            &victim,
+            &frame::Outgoing {
+                recipient: crypto::BROADCAST_ID,
+                msg_id: [77u8; 16],
+                epoch: 9,
+                counter: 0,
+                ttl: 1,
+                body: &forged_bundle,
+                nickname: "victim",
+                kind: FrameKind::Beacon,
+                sealing: frame::Sealing::Network,
+            },
+        )
+        .unwrap();
+
+        a.core.ingest(-40, &wire).unwrap();
+        settle();
+        a.radio.drain();
+
+        // A now sends to the victim. If the forged prekey had been installed,
+        // the frame would carry FLAG_FS and be readable by the attacker.
+        a.core
+            .send_message(Some(victim.public_id()), b"secret")
+            .unwrap();
+        settle();
+
+        let sent_fs = a
+            .radio
+            .drain()
+            .into_iter()
+            .filter_map(|w| frame::parse(&w).ok().map(|p| p.is_forward_secret()))
+            .any(|fs| fs);
+        assert!(
+            !sent_fs,
+            "a forged bundle must not be used to seal anything"
         );
     }
 

@@ -27,6 +27,21 @@ pub const KIND_TRANSPORT_STATE: u8 = 5;
 pub const KIND_ERROR: u8 = 6;
 pub const KIND_MESSAGE_EXPIRED: u8 = 7;
 
+/// `flags` bit set on a MessageReceived event whose frame was forward secret.
+pub const EVENT_FLAG_FORWARD_SECRET: u16 = 0b0000_0001;
+
+/// Arguments for [`Event::message_received`].
+#[derive(Debug, Clone)]
+pub struct ReceivedMessage {
+    pub sender: PeerId,
+    pub msg_id: [u8; 16],
+    pub ttl: u8,
+    pub hops: u8,
+    pub rssi: i8,
+    pub forward_secret: bool,
+    pub body: Vec<u8>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Event {
     pub seq: u32,
@@ -51,6 +66,9 @@ pub enum EventKind {
         ttl: u8,
         hops: u8,
         rssi: i8,
+        /// False means the sender had no prekey for us and fell back to
+        /// static-static. The UI must not imply a guarantee that is absent.
+        forward_secret: bool,
         body: Vec<u8>,
     },
     MessageDelivered {
@@ -96,24 +114,20 @@ impl Event {
         Self::new(seq, EventKind::PeerLost { peer })
     }
 
-    pub fn message_received(
-        seq: u32,
-        sender: PeerId,
-        msg_id: [u8; 16],
-        ttl: u8,
-        hops: u8,
-        rssi: i8,
-        body: Vec<u8>,
-    ) -> Self {
+    /// Takes a struct rather than eight positional arguments — four of which
+    /// are small integers and one a bare `bool`, i.e. exactly the shape a call
+    /// site silently gets wrong. Same reasoning as `frame::Outgoing`.
+    pub fn message_received(seq: u32, m: ReceivedMessage) -> Self {
         Self::new(
             seq,
             EventKind::MessageReceived {
-                sender,
-                msg_id,
-                ttl,
-                hops,
-                rssi,
-                body,
+                sender: m.sender,
+                msg_id: m.msg_id,
+                ttl: m.ttl,
+                hops: m.hops,
+                rssi: m.rssi,
+                forward_secret: m.forward_secret,
+                body: m.body,
             },
         )
     }
@@ -172,9 +186,20 @@ impl Event {
         };
         let mut w = Vec::with_capacity(EVENT_HEADER_LEN + body_hint);
 
+        // The reserved flags field finally earns its keep: rather than widen
+        // the MessageReceived body (and shift every offset the TS decoder
+        // knows), the forward-secrecy bit rides in the header.
+        let flags = match &self.kind {
+            EventKind::MessageReceived {
+                forward_secret: true,
+                ..
+            } => EVENT_FLAG_FORWARD_SECRET,
+            _ => 0,
+        };
+
         w.push(crate::ABI_VERSION as u8);
         w.push(self.kind_tag());
-        w.extend_from_slice(&0u16.to_le_bytes()); // flags, reserved
+        w.extend_from_slice(&flags.to_le_bytes());
         w.extend_from_slice(&self.seq.to_le_bytes());
         w.extend_from_slice(&self.ts_ms.to_le_bytes());
         debug_assert_eq!(w.len(), EVENT_HEADER_LEN);
@@ -199,6 +224,7 @@ impl Event {
                 hops,
                 rssi,
                 body,
+                ..
             } => {
                 w.extend_from_slice(sender);
                 w.extend_from_slice(msg_id);
@@ -239,11 +265,26 @@ mod tests {
 
     #[test]
     fn message_received_layout_is_stable() {
-        let ev = Event::message_received(42, [9u8; 32], [1u8; 16], 5, 2, -60, b"body".to_vec());
+        let ev = Event::message_received(
+            42,
+            ReceivedMessage {
+                sender: [9u8; 32],
+                msg_id: [1u8; 16],
+                ttl: 5,
+                hops: 2,
+                rssi: -60,
+                forward_secret: true,
+                body: b"body".to_vec(),
+            },
+        );
         let w = ev.to_wire();
 
         assert_eq!(w[0], crate::ABI_VERSION as u8);
         assert_eq!(w[1], KIND_MESSAGE_RECEIVED);
+        assert_eq!(
+            u16::from_le_bytes(w[2..4].try_into().unwrap()),
+            EVENT_FLAG_FORWARD_SECRET
+        );
         assert_eq!(u32::from_le_bytes(w[4..8].try_into().unwrap()), 42);
         assert_eq!(&w[16..48], &[9u8; 32]);
         assert_eq!(&w[48..64], &[1u8; 16]);
@@ -262,7 +303,18 @@ mod tests {
         for ev in [
             Event::peer_discovered(1, [0u8; 32], "bob", -40, 1),
             Event::peer_lost(2, [0u8; 32]),
-            Event::message_received(3, [0u8; 32], [0u8; 16], 4, 0, -50, vec![0; 200]),
+            Event::message_received(
+                3,
+                ReceivedMessage {
+                    sender: [0u8; 32],
+                    msg_id: [0u8; 16],
+                    ttl: 4,
+                    hops: 0,
+                    rssi: -50,
+                    forward_secret: false,
+                    body: vec![0; 200],
+                },
+            ),
             Event::message_delivered(4, [0u8; 16], true),
             Event::message_expired(7, [0u8; 16], "no ack"),
             Event::transport_state(5, true),

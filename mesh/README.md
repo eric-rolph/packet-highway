@@ -29,7 +29,10 @@ mesh.initialize({ nickname: 'ada' });
 
 mesh.on('peerDiscovered', (e) => console.log('saw', e.nickname, e.rssi));
 mesh.on('messageReceived', (e) =>
-  console.log(peerIdToHex(e.sender), new TextDecoder().decode(e.body)),
+  // `forwardSecret` is false when the sender had no prekey for us and fell
+  // back to static-static. Show the difference; don't imply the guarantee.
+  console.log(peerIdToHex(e.sender), e.forwardSecret ? '🔒' : '⚠️',
+              new TextDecoder().decode(e.body)),
 );
 
 // Directed messages are held until acked, retried with backoff, and reported
@@ -52,8 +55,9 @@ js/       thin API + binary event decoder
 shared/cpp/   one JSI HostObject, compiled by BOTH platforms
   ↕ C ABI (cbindgen-generated header)
 rust/meshcore-ffi/   the only crate with #[no_mangle]
-rust/meshcore/       pure Rust: framing, X25519+ChaCha20Poly1305, flood routing,
-                     anti-replay window, store-and-forward outbox
+rust/meshcore/       pure Rust: framing, Ed25519 identity + X3DH forward secrecy,
+                     ChaCha20-Poly1305, flood routing, anti-replay window,
+                     store-and-forward outbox
   ↕ PlatformRadio trait (injected)
 ios/MeshRadio.mm     CoreBluetooth
 android/MeshRadio.kt BluetoothLe{Scanner,Advertiser}

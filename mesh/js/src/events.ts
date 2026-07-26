@@ -12,9 +12,15 @@
  */
 
 /** Must equal `meshcore::ABI_VERSION`. Asserted at install time. */
-export const MESH_ABI_VERSION = 2;
+export const MESH_ABI_VERSION = 3;
 
 const HEADER_LEN = 16;
+
+/**
+ * Header `flags` bits. The forward-secrecy bit rides here rather than in the
+ * MessageReceived body so adding it did not shift every offset below it.
+ */
+const FLAG_FORWARD_SECRET = 0b0000_0001;
 
 export const EventKind = {
   PeerDiscovered: 1,
@@ -53,6 +59,12 @@ export interface MessageReceivedEvent extends Base {
   ttl: number;
   hops: number;
   rssi: number;
+  /**
+   * False means the sender had no prekey for us and fell back to
+   * static-static: the message is authenticated and encrypted, but **not**
+   * forward secret. Do not show a guarantee the transport did not give you.
+   */
+  forwardSecret: boolean;
   /** Zero-copy view over the decrypted plaintext. */
   body: Uint8Array;
 }
@@ -112,6 +124,7 @@ export function decodeEvent(buffer: ArrayBuffer): MeshEvent {
   }
 
   const kind = view.getUint8(1);
+  const flags = view.getUint16(2, true);
   const seq = view.getUint32(4, true);
   // Timestamps are u64 ms. getBigUint64 -> Number is exact until year 287396;
   // Number is what every JS date API wants anyway.
@@ -147,7 +160,17 @@ export function decodeEvent(buffer: ArrayBuffer): MeshEvent {
       const bodyLen = view.getUint32(o, true);
       o += 4;
       const body = new Uint8Array(buffer, o, bodyLen);
-      return { ...base, type: 'messageReceived', sender, messageId, ttl, hops, rssi, body };
+      return {
+        ...base,
+        type: 'messageReceived',
+        sender,
+        messageId,
+        ttl,
+        hops,
+        rssi,
+        forwardSecret: (flags & FLAG_FORWARD_SECRET) !== 0,
+        body,
+      };
     }
 
     case EventKind.MessageDelivered: {

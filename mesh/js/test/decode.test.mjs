@@ -77,7 +77,17 @@ test('messageReceived round-trips with correct body and signed rssi', () => {
   assert.equal(e.ttl, 6);
   assert.equal(e.hops, 2);
   assert.equal(e.rssi, -71);
+  assert.equal(e.forwardSecret, true);
   assert.equal(new TextDecoder().decode(e.body), 'hello mesh');
+});
+
+test('the forward-secrecy flag is decoded, not assumed', () => {
+  // Same event kind, sealed with the static-static fallback. If the decoder
+  // ignored the header flags this would wrongly claim a guarantee it lacks.
+  const e = decodeEvent(toArrayBuffer(cases.messageReceivedNoFs.hex));
+  assert.equal(e.type, 'messageReceived');
+  assert.equal(e.forwardSecret, false);
+  assert.equal(new TextDecoder().decode(e.body), 'fallback');
 });
 
 test('message body is a view, not a copy', () => {

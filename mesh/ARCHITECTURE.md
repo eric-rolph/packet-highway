@@ -113,7 +113,8 @@ mesh/
 │   ├── Cargo.toml                     profile: opt-level=z, fat LTO, panic=abort
 │   ├── meshcore/                      ── PURE RUST, host-testable, zero FFI
 │   │   ├── src/lib.rs                 MeshCore, worker thread, PlatformRadio/EventSink traits
-│   │   ├── src/crypto.rs              X25519 + ChaCha20-Poly1305, Identity
+│   │   ├── src/crypto.rs              Ed25519 identity, X25519 DH, ChaCha20-Poly1305
+│   │   ├── src/prekey.rs              rotating signed prekeys (forward secrecy)
 │   │   ├── src/frame.rs               wire format v2, build/open/relay
 │   │   ├── src/replay.rs              per-sender sliding anti-replay window
 │   │   ├── src/outbox.rs              store-and-forward: acks, backoff, expiry
@@ -325,6 +326,80 @@ the boundary cost for the same work.
 
 ---
 
+## 5a. Forward secrecy
+
+### The transport dictates the design
+
+Noise XX is the obvious answer and the wrong one here. It needs 1.5 round trips,
+and the transport is a connectionless BLE advertisement over a mesh where a peer
+may be in range for eight seconds and a handshake may simply never complete.
+A protocol you cannot finish provides no secrecy at all.
+
+So directed messages use an **X3DH-shaped exchange with zero round trips**:
+
+```
+DH1 = DH(ephemeral_sender, prekey_recipient)   <- provides forward secrecy
+DH2 = DH(static_sender,    prekey_recipient)   <- authenticates the sender
+key = KDF(DH1 ‖ DH2 ‖ sender ‖ recipient ‖ generation)
+```
+
+The sender drops the ephemeral secret immediately. Once the recipient rotates
+that prekey out of its ring, the message is unrecoverable **even if both
+long-term keys are later compromised** — the property static-static ECDH never
+had.
+
+### Identity moved to Ed25519
+
+`PeerId` is now a 32-byte **Ed25519** public key; DH uses the birationally
+equivalent X25519 form of the same key (`to_scalar_bytes` / `to_montgomery`).
+One keypair, two uses.
+
+The reason is not aesthetic: **a node has to sign its prekeys**, and X25519 keys
+cannot sign. Beacons are sealed with the group network key, which every member
+holds — so without a signature any member could beacon a prekey under someone
+else's id and collect their directed mail. `a_forged_prekey_bundle_is_not_installed`
+is the test for exactly that attack.
+
+### Rotation is what actually delivers it
+
+Key agreement alone is not forward secrecy; **the secret ceasing to exist** is.
+`x25519`'s `StaticSecret` zeroizes on drop, so evicting the back of the prekey
+ring is the security event:
+
+```
+gen 7  current   <- advertised in every beacon
+gen 6  retired   \
+gen 5  retired    > in-flight grace
+gen 4  retired   /
+gen 3  dropped   <- zeroized; this traffic is now unrecoverable
+```
+
+Exposure window for a stolen ring is `ROTATE_INTERVAL_MS × (RETAINED + 1)` =
+4 minutes. Retention must also *exceed* the 120s outbox deadline, or a retried
+message could arrive addressed to a prekey that no longer exists — and
+`retention_outlives_the_outbox_deadline` pins that relationship so nobody tunes
+one constant without the other.
+
+### Honest about the fallback
+
+Sending to a peer whose beacon we have never seen has no prekey to use. Rather
+than refuse, the frame falls back to static-static, `FLAG_FS` stays clear, and
+the receiver reports `forwardSecret: false` so the UI can say so instead of
+implying a guarantee it does not have. The flag is authenticated (it is in the
+AAD), so an attacker cannot downgrade a frame by flipping it.
+
+### A bug this work surfaced
+
+Writing the "invalid peer id" test turned up a real vulnerability in the DH
+path. `VerifyingKey::from_bytes` accepts small-order points — `[0u8; 32]` and
+`y = 1` decompress perfectly well — and DH against them drives the shared secret
+to **all zeros**. Anyone choosing such an id could have fixed the key for
+everyone who talked to them. Every DH in the crate now routes through one
+`dh()` helper that checks `was_contributory()`; centralising it is what stops a
+future call site from forgetting the check.
+
+---
+
 ## 5b. Delivery, replay and store-and-forward
 
 Three properties a flood mesh does not give you for free, added in the core so
@@ -385,21 +460,26 @@ Both are little-endian (both mobile targets are LE) and versioned by
 stops a cached `.so` from an older build from silently mis-decoding every event
 into plausible-looking garbage.
 
-**Frame v2** (116-byte header + optional nickname + AEAD ciphertext):
+**Frame v3** (116-byte header + optional FS preamble + nickname + ciphertext):
 
 ```
-0   magic 'M' │ 1  version │ 2  flags │ 3  ttl* │ 4  hops* │ 5  nick_len
+0   magic 'M' │ 1  version │ 2  flags* │ 3  ttl† │ 4  hops† │ 5  nick_len
 6   body_len u16 │ 8  epoch u64 │ 16 counter u64
-24  sender[32] │ 56 recipient[32] │ 88 msg_id[16] │ 104 nonce[12]
-116 nickname │ … ciphertext‖tag
+24  sender[32] (Ed25519) │ 56 recipient[32] │ 88 msg_id[16] │ 104 nonce[12]
+116 [only if FLAG_FS] ephemeral_pubkey[32] ‖ prekey_generation u32
+ ..  nickname │ … ciphertext‖tag
 ```
 
-`ttl`/`hops` (marked `*`) are **outside the AAD** — a relay must be able to
-decrement TTL without holding a key. Everything else is inside it, including
-`epoch` and `counter`, which is what makes the anti-replay window trustworthy.
-`header_tampering_is_caught` flips **every** authenticated header byte one at a
-time and asserts each is detected; `relaying_preserves_authenticity` asserts the
-two mutable ones are not.
+`ttl`/`hops` (†) are the only fields outside the AAD — a relay must decrement
+TTL without holding a key. Everything else is authenticated, including `epoch`,
+`counter`, the flags (*) and the FS preamble, so an attacker can neither replay,
+downgrade off the FS path, nor re-point a frame at a different prekey.
+
+The FS preamble is **conditional** rather than a fixed header field: beacons and
+broadcasts can never be forward secret, and making them pay 36 bytes each on a
+radio where a legacy advertisement holds 31 bytes total would be careless.
+`header_tampering_is_caught` flips every authenticated header byte one at a
+time; `the_fs_preamble_is_authenticated` does the same for the preamble.
 
 **Event**: 16-byte header (`version, kind, flags, seq, ts_ms`) then a
 kind-specific body, serialised into exactly one heap allocation whose capacity
@@ -442,31 +522,44 @@ Two build choices worth stating:
 
 ## 8. Test coverage today
 
-58 tests, all runnable on a laptop with no device, all enforced by CI
+82 tests, all runnable on a laptop with no device, all enforced by CI
 (`.github/workflows/meshcore.yml`).
 
-- **45 Rust** (`cargo test`):
-  - *crypto* — AEAD tamper rejection, wrong-AAD rejection, symmetric key agreement.
-  - *frame* — broadcast/directed roundtrip, relay preserves authenticity,
-    **every** authenticated header byte flipped one at a time, epoch/counter
-    authentication, multibyte nickname truncation on a char boundary, v1 frames
-    rejected rather than misparsed, garbage input.
-  - *replay* — in-order traffic, exact replay, reordering inside the window,
+- **62 Rust core + 6 FFI** (`cargo test`):
+  - *crypto* — AEAD tamper and wrong-AAD rejection, Ed25519↔X25519 agreement in
+    both directions, malformed peer ids refused at decode, **small-order peer
+    ids refused at DH** (the vulnerability §5a describes), FS key agreement
+    matching on both sides, generation bound into the transcript, long-term keys
+    alone insufficient to derive a message key, prekey signatures bound to one
+    identity.
+  - *prekey* — retention keeps in-flight mail decryptable, rotating past the
+    depth destroys the secret, rotation respects its interval, retention
+    outlives the outbox deadline, bundles round-trip, bundles attributed to the
+    wrong peer or tampered at any of four offsets are refused.
+  - *frame* — broadcast/directed/FS roundtrips, relay preserves authenticity,
+    **every** authenticated header byte flipped one at a time, FS preamble
+    authenticated, a rotated-out prekey cannot open the frame, truncated FS
+    preamble rejected structurally, multibyte nickname truncation, v1/v2 frames
+    rejected rather than misparsed, a maximal frame fits the ceiling exactly.
+  - *replay* — in-order, exact replay, reordering inside the window,
     beyond-window rejection, a >64 jump that would be a shift overflow, restart
     resets, whole-session replay refused, `u64::MAX` saturation.
   - *outbox* — backoff growth and cap, ack removal, peer-discovery wake, bounded
     eviction, retry byte-identity, re-queue consistency.
-  - *core* — two-node mesh handshake, dedup suppression, **replay rejected even
-    with a fresh msg_id** (the case dedup cannot see), directed ack clears the
-    outbox, broadcast needs no ack, unacked retry, a relay carrying a frame it
-    cannot read, own re-flood ignored, queue flush on peer discovery.
+  - *core* — two-node handshake, dedup, replay rejected with a fresh msg_id,
+    directed ack clears the outbox, unacked retry, a relay carrying a frame it
+    cannot read, own re-flood ignored, queue flush on peer discovery,
+    **FS negotiated once the prekey is known**, **fallback admits it is not FS**,
+    broadcasts never claim FS, **a forged prekey bundle is never installed**.
   - *FFI* — full C-ABI lifecycle with a mock radio and sink, null-safety on every
     entry point, garbage-ingest fuzz over every prefix length, `MeshBuffer`
     non-copying roundtrip.
-- **13 JS** (`node --test`) — the decoder against bytes emitted by the *actual*
-  Rust encoder, including signed RSSI, non-ASCII nicknames, the zero-copy view
-  assertion (`body.buffer === source`), ABI-mismatch and truncation failures, and
-  a check that every event kind Rust emits has a decoder branch.
+- **14 JS** (`node --test`) — the decoder against bytes emitted by the *actual*
+  Rust encoder: signed RSSI, non-ASCII nicknames, the zero-copy view assertion
+  (`body.buffer === source`), the forward-secrecy flag decoded rather than
+  assumed (two fixtures of the same kind differing only in that bit),
+  ABI-mismatch and truncation failures, and a check that every event kind Rust
+  emits has a decoder branch.
 
 That last suite matters more than its size suggests: `event.rs` and `events.ts`
 have no compiler between them, so a hand-written decoder drifting from the
@@ -489,38 +582,53 @@ so the mobile targets validate on a plain Ubuntu runner in seconds — no NDK, n
 Xcode, no macOS minutes. It catches target-gated breakage (JNI signatures, libc
 differences) long before a device build would.
 
+`-D warnings` is passed to clippy after `--` rather than set as a global
+`RUSTFLAGS`, because cargo applies `RUSTFLAGS` to dependency crates too and one
+warning in a transitive dependency would then fail the build.
+
 ## 9. What is scaffolding, and what to do next
 
 Honest inventory of what is *not* production-ready:
 
-1. **Crypto has no forward secrecy.** Directed messages use static-static
-   X25519 → HKDF → ChaCha20-Poly1305: zero round trips, which matters when the
-   transport is a connectionless advertisement and a handshake may never
-   complete — but compromising a long-term key retroactively decrypts
-   everything. Broadcast uses a group key derived from a constant channel
-   secret. Replace with Noise XX + a Double Ratchet per peer; `crypto.rs` is
-   shaped so that swap stays local to the module. **This is the biggest
-   remaining gap and deserves its own change** — it is a wire-format break and a
-   design decision (Noise XX vs X3DH vs rotating prekeys), not a patch.
-2. **Epoch depends on the wall clock.** See §5b: a device whose clock rolls
-   backwards has its frames refused by peers until it restarts with a good
-   clock. Fix is a persisted boot counter; `Config::epoch` already takes one.
-3. **GATT is stubbed on Android.** `MeshRadio.sendDirect` returns `false`, so
+1. **Broadcasts are not forward secret.** They are sealed with a group key every
+   member holds, so there is no per-recipient exchange to be forward secret
+   about. A sender-keys ratchet (per-sender chain key, ratcheted per message,
+   distributed pairwise using the now-forward-secret directed path) is the
+   natural next step and the largest remaining crypto gap.
+2. **No post-compromise security.** There is no Double Ratchet, so an attacker
+   who steals the prekey ring reads directed traffic until the next rotation —
+   bounded at four minutes by §5a, not zero. A ratchet on top of the existing
+   X3DH exchange closes it; `crypto.rs` is shaped so the key-derivation swap
+   stays local.
+3. **The channel secret is a constant.** `CHANNEL_SECRET` in `crypto.rs` is a
+   placeholder for the per-channel secret a user actually joins with. Until it
+   is real, "the network key" means "anyone with this build".
+4. **Epoch depends on the wall clock.** See §5b: a device whose clock rolls
+   backwards has its frames refused by peers until it restarts. The fix is a
+   persisted boot counter; `Config::epoch` already accepts one.
+5. **Identity is not persisted.** The 32-byte seed should live in the Keychain
+   (iOS) / Keystore-wrapped (Android) and be passed to `initializeCore`. Pair it
+   with the boot counter from (4) — same blob, same write. Until then every
+   launch is a new identity and no peer can recognise you twice.
+6. **GATT is stubbed on Android.** `MeshRadio.sendDirect` returns `false`, so
    Rust floods. Correct behaviour, but directed sends never get the fast path
    until the `peerId → BluetoothGatt` map is wired up.
-4. **iOS background operation** needs `UIBackgroundModes` = `bluetooth-central`
+7. **A queued message keeps its original sealing.** The outbox stores sealed
+   bytes on purpose (re-sealing would burn replay counters), so a message queued
+   before the recipient's beacon arrived stays non-FS through its retries. Only
+   messages sent *after* the prekey is known get the upgrade.
+8. **iOS background operation** needs `UIBackgroundModes` = `bluetooth-central`
    + `bluetooth-peripheral`, and the service UUID moves to the overflow area
    where only other iOS devices can see it. **Android background** needs a
    foreground service, or the scanner is throttled to ~1 result per 5 minutes
    with the screen off.
-5. **Identity is not persisted.** The 32-byte seed should go in the Keychain
-   (iOS) / Keystore-wrapped (Android) and be passed to `initializeCore`. Pair it
-   with the boot counter from (2) — same blob, same write.
-6. **Relay-side store-and-forward is not implemented.** A node retries its *own*
+9. **Relay-side store-and-forward is not implemented.** A node retries its *own*
    undelivered messages (§5b), but does not cache and later re-flood frames it
-   merely relayed for a peer that was out of range. That is the difference
-   between a mesh that heals over minutes and one that heals over hours.
-7. **The native layers are unverified by CI.** The Objective-C++ and
-   Kotlin/CMake code compiles only under Xcode and the Android NDK, neither of
-   which is on the CI runner. `cargo check` covers the mobile *Rust* targets;
-   the platform layers need a macOS runner and an SDK image to gate properly.
+   merely relayed for a peer that was out of range.
+10. **The native layers are unverified by CI.** The Objective-C++ and
+    Kotlin/CMake code compiles only under Xcode and the Android NDK, neither of
+    which is on the CI runner. `cargo check` covers the mobile *Rust* targets;
+    the platform layers need a macOS runner and an SDK image to gate properly.
+
+None of this is a reason to hold the current work — each item is independent and
+the tests pin the behaviour that exists today.

@@ -5,7 +5,7 @@
 //! Run:  cargo run -p meshcore --example dump_event_fixtures
 //! Used by: js/test/decode.test.mjs
 
-use meshcore::event::{Event, KIND_MESSAGE_RECEIVED};
+use meshcore::event::{Event, ReceivedMessage, KIND_MESSAGE_RECEIVED};
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
@@ -23,7 +23,35 @@ fn main() {
         ("peerLost", Event::peer_lost(2, peer)),
         (
             "messageReceived",
-            Event::message_received(3, peer, msg_id, 6, 2, -71, b"hello mesh".to_vec()),
+            Event::message_received(
+                3,
+                ReceivedMessage {
+                    sender: peer,
+                    msg_id,
+                    ttl: 6,
+                    hops: 2,
+                    rssi: -71,
+                    forward_secret: true,
+                    body: b"hello mesh".to_vec(),
+                },
+            ),
+        ),
+        // Same kind, forward-secrecy flag clear: pins that the decoder reads
+        // the header flags rather than assuming the guarantee.
+        (
+            "messageReceivedNoFs",
+            Event::message_received(
+                8,
+                ReceivedMessage {
+                    sender: peer,
+                    msg_id,
+                    ttl: 6,
+                    hops: 2,
+                    rssi: -71,
+                    forward_secret: false,
+                    body: b"fallback".to_vec(),
+                },
+            ),
         ),
         (
             "messageDelivered",
@@ -55,6 +83,17 @@ fn main() {
 
     // Sanity: the layout test in event.rs pins these offsets; if this assert
     // ever fires the fixtures are meaningless.
-    let probe = Event::message_received(0, peer, msg_id, 1, 1, -1, b"x".to_vec());
+    let probe = Event::message_received(
+        0,
+        ReceivedMessage {
+            sender: peer,
+            msg_id,
+            ttl: 1,
+            hops: 1,
+            rssi: -1,
+            forward_secret: true,
+            body: b"x".to_vec(),
+        },
+    );
     assert_eq!(probe.kind_tag(), KIND_MESSAGE_RECEIVED);
 }
