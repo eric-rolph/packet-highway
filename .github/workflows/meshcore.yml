@@ -14,8 +14,10 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # Fail on warnings in CI without making local `cargo build` miserable.
-  RUSTFLAGS: -D warnings
+  # Deliberately NOT setting `RUSTFLAGS: -D warnings` here: cargo applies
+  # RUSTFLAGS to dependency crates too, so one warning in a transitive
+  # dependency we do not control would fail the build. `-D warnings` is passed
+  # to clippy after `--` instead, where it applies only to our own crates.
 
 defaults:
   run:
@@ -40,7 +42,7 @@ jobs:
         run: cargo fmt --manifest-path rust/Cargo.toml --all --check
 
       - name: Clippy
-        run: cargo clippy --manifest-path rust/Cargo.toml --all-targets --all-features
+        run: cargo clippy --manifest-path rust/Cargo.toml --all-targets --all-features -- -D warnings
 
       - name: Test
         run: cargo test --manifest-path rust/Cargo.toml --all-features
@@ -99,9 +101,12 @@ jobs:
           workspaces: mesh/rust
 
       - name: Typecheck
+        # In js/, which is where package.json lives — `npm install` in mesh/
+        # would create a stray lockfile-less install one level up.
+        working-directory: mesh/js
         run: |
           npm install --no-save --silent typescript@5.4
-          npx tsc -p js/tsconfig.ci.json
+          npx tsc -p tsconfig.ci.json
 
       - name: Wire-format contract (Rust encoder -> TS decoder)
         run: node --test test/decode.test.mjs
