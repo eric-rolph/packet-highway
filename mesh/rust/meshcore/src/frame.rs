@@ -1,6 +1,6 @@
-//! Wire format v3.
+//! Wire format v4.
 //!
-//! One fixed-size header, an optional forward-secrecy preamble, an optional
+//! One fixed-size header, at most one key-agreement preamble, an optional
 //! nickname, then AEAD ciphertext. Everything is little-endian (both mobile
 //! targets are LE). Parsing borrows the input — no allocation until you `open`.
 //!
@@ -8,7 +8,8 @@
 //!  off  len  field
 //!   0    1   magic 0x4D ('M')
 //!   1    1   version
-//!   2    1   flags        bit0 = beacon, bit1 = ack, bit2 = forward secret
+//!   2    1   flags        bit0 beacon, bit1 ack, bit2 FS preamble,
+//!                         bit3 sender-key preamble, bit4 sender-key dist
 //!   3    1   ttl          MUTABLE on relay -> excluded from AAD
 //!   4    1   hops         MUTABLE on relay -> excluded from AAD
 //!   5    1   nickname_len (<= 20)
@@ -22,15 +23,21 @@
 //! 116   36   FS preamble — PRESENT ONLY IF flags bit2:
 //!                [32] ephemeral X25519 public key
 //!                [ 4] recipient prekey generation, u32 LE
+//! 116    8   SK preamble — PRESENT ONLY IF flags bit3:
+//!                [ 4] sender chain id, u32 LE
+//!                [ 4] message index within the chain, u32 LE
 //!  ..    n   nickname (utf-8)
 //!  ..    m   ciphertext || tag
 //! ```
 //!
-//! The FS preamble is conditional rather than a fixed header field so beacons
-//! and broadcasts — which can never be forward secret — do not pay 36 bytes
-//! each on a radio where every byte is scarce. It sits *outside* the ciphertext
-//! because the recipient needs it to derive the key, and *inside* the AAD so it
-//! cannot be swapped in flight.
+//! Preambles are conditional rather than fixed header fields so a beacon does
+//! not pay for machinery it cannot use, on a radio where every byte is scarce.
+//! They sit *outside* the ciphertext because the recipient needs them to derive
+//! the key, and *inside* the AAD so they cannot be swapped in flight.
+//!
+//! The two are **mutually exclusive** — one is directed, the other broadcast —
+//! and a frame setting both is rejected structurally rather than resolved by
+//! precedence. An ambiguous length prefix is how parsers grow bugs.
 //!
 //! `ttl`/`hops` are deliberately outside the AAD: a relay must be able to
 //! decrement TTL without holding a key. **Everything else is inside it** —
@@ -42,15 +49,18 @@ use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::crypto::{self, Identity, PeerId, NONCE_LEN, TAG_LEN};
 use crate::prekey::PeerPrekey;
+use crate::senderkey;
 use crate::CoreError;
 
 pub const MAGIC: u8 = 0x4D;
-pub const VERSION: u8 = 3;
+pub const VERSION: u8 = 4;
 pub const HEADER_LEN: usize = 116;
 pub const MAX_NICKNAME: usize = 20;
 
 /// Length of the FS preamble when present: ephemeral pubkey + prekey generation.
 pub const FS_PREAMBLE_LEN: usize = 32 + 4;
+/// Length of the sender-key preamble when present: chain id + message index.
+pub const SK_PREAMBLE_LEN: usize = senderkey::PREAMBLE_LEN;
 
 /// Total on-air frame ceiling. A BLE 5 extended advertisement (`ADV_EXT_IND`)
 /// carries up to 254 bytes; anything above that the platform layer must send
@@ -66,6 +76,11 @@ pub const FLAG_ACK: u8 = 0b0000_0010;
 /// Set when the frame carries an FS preamble and is sealed with a
 /// forward-secret key rather than the static-static fallback.
 pub const FLAG_FS: u8 = 0b0000_0100;
+/// Set when the frame carries a sender-key preamble — a broadcast sealed with a
+/// ratcheted chain key rather than the static group key.
+pub const FLAG_SK: u8 = 0b0000_1000;
+/// Frame kind: this is a sender-key distribution, not user traffic.
+pub const FLAG_SKDM: u8 = 0b0001_0000;
 
 /// Offsets of the two fields a relay may rewrite. Named because three separate
 /// places have to agree on them.
@@ -81,6 +96,9 @@ pub enum FrameError {
     UnsupportedVersion(u8),
     LengthMismatch,
     BadNickname,
+    /// Both preamble bits set. They imply different lengths and different key
+    /// agreements; rather than pick one, refuse the frame.
+    ConflictingPreambles,
 }
 
 /// What a frame is for. Derived from `flags`, so callers match on an enum
@@ -91,6 +109,9 @@ pub enum FrameKind {
     Beacon,
     /// Delivery receipt: body is the 16-byte msg_id being acknowledged.
     Ack,
+    /// Sender-key distribution: body is the sender's broadcast chain, handed to
+    /// one peer over the forward-secret directed path. Never broadcast.
+    SenderKey,
     /// Ordinary message.
     Message,
 }
@@ -102,9 +123,18 @@ pub struct FsPreamble {
     pub generation: u32,
 }
 
+/// The sender-key preamble, when present. Tells the receiver which chain and
+/// which position to ratchet to; both are inside the AAD.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SkPreamble {
+    pub chain_id: u32,
+    pub index: u32,
+}
+
 /// How to derive the sealing key for an outgoing frame.
 pub enum Sealing<'a> {
-    /// Broadcast and beacons: the group key every member holds.
+    /// Beacons, and broadcasts from a node with no peers to distribute a chain
+    /// to: the group key every member holds. Not forward secret.
     Network,
     /// Directed, but we have never seen a prekey for the recipient. Works, but
     /// is not forward secret — the receiver is told so.
@@ -115,6 +145,13 @@ pub enum Sealing<'a> {
         ephemeral: &'a StaticSecret,
         prekey: &'a PeerPrekey,
     },
+    /// Broadcast with forward secrecy. `key` is one message key taken from our
+    /// sender chain, which has already ratcheted past it.
+    SenderKey {
+        chain_id: u32,
+        index: u32,
+        key: &'a [u8; 32],
+    },
 }
 
 /// How to derive the opening key for an inbound frame.
@@ -122,6 +159,7 @@ pub enum Opening<'a> {
     Network,
     Static,
     ForwardSecret { prekey_secret: &'a StaticSecret },
+    SenderKey { key: &'a [u8; 32] },
 }
 
 /// A parsed view over the caller's buffer. Zero-copy: `ciphertext` points into
@@ -138,6 +176,7 @@ pub struct ParsedFrame<'a> {
     pub hops: u8,
     pub kind: FrameKind,
     pub fs: Option<FsPreamble>,
+    pub sk: Option<SkPreamble>,
     pub nickname: String,
     pub ciphertext: &'a [u8],
     /// Header (+ preamble) with the mutable fields zeroed — exactly what was
@@ -156,10 +195,11 @@ impl<'a> ParsedFrame<'a> {
         self.recipient == crypto::BROADCAST_ID
     }
 
-    /// True when the sender used the forward-secret path. Surfaced to the UI so
-    /// it can distinguish a guarantee it has from one it does not.
+    /// True when the sender used a forward-secret path — the prekey exchange
+    /// for directed frames, the sender-key ratchet for broadcasts. Surfaced to
+    /// the UI so it can distinguish a guarantee it has from one it does not.
     pub fn is_forward_secret(&self) -> bool {
-        self.fs.is_some()
+        self.fs.is_some() || self.sk.is_some()
     }
 
     pub fn aad(&self) -> &[u8] {
@@ -189,7 +229,15 @@ pub fn parse(buf: &[u8]) -> Result<ParsedFrame<'_>, FrameError> {
     // The preamble is length-bearing, so it must be resolved before any of the
     // offsets after the header can be trusted.
     let has_fs = flags & FLAG_FS != 0;
-    let preamble_len = if has_fs { FS_PREAMBLE_LEN } else { 0 };
+    let has_sk = flags & FLAG_SK != 0;
+    if has_fs && has_sk {
+        return Err(FrameError::ConflictingPreambles);
+    }
+    let preamble_len = match (has_fs, has_sk) {
+        (true, _) => FS_PREAMBLE_LEN,
+        (_, true) => SK_PREAMBLE_LEN,
+        _ => 0,
+    };
     if buf.len() < HEADER_LEN + preamble_len {
         return Err(FrameError::TooShort);
     }
@@ -204,6 +252,14 @@ pub fn parse(buf: &[u8]) -> Result<ParsedFrame<'_>, FrameError> {
         FsPreamble {
             ephemeral,
             generation: u32::from_le_bytes(p[32..36].try_into().expect("4 bytes")),
+        }
+    });
+
+    let sk = has_sk.then(|| {
+        let p = &buf[HEADER_LEN..HEADER_LEN + SK_PREAMBLE_LEN];
+        SkPreamble {
+            chain_id: u32::from_le_bytes(p[0..4].try_into().expect("4 bytes")),
+            index: u32::from_le_bytes(p[4..8].try_into().expect("4 bytes")),
         }
     });
 
@@ -228,6 +284,8 @@ pub fn parse(buf: &[u8]) -> Result<ParsedFrame<'_>, FrameError> {
         FrameKind::Beacon
     } else if flags & FLAG_ACK != 0 {
         FrameKind::Ack
+    } else if flags & FLAG_SKDM != 0 {
+        FrameKind::SenderKey
     } else {
         FrameKind::Message
     };
@@ -245,6 +303,7 @@ pub fn parse(buf: &[u8]) -> Result<ParsedFrame<'_>, FrameError> {
         hops: buf[OFF_HOPS],
         kind,
         fs,
+        sk,
         nickname,
         ciphertext: &buf[nick_start + nick_len..],
         aad_buf,
@@ -296,9 +355,12 @@ pub fn build(identity: &Identity, out: &Outgoing<'_>) -> Result<Vec<u8>, CoreErr
 
     // Resolve the key and the preamble together — they are two halves of one
     // decision, and letting them diverge would produce a frame nobody can open.
-    let (key, preamble) = match &out.sealing {
-        Sealing::Network => (crypto::network_key(), None),
-        Sealing::Static => (identity.derive_static_key(&out.recipient)?, None),
+    // The preamble is carried as bytes plus the flag that declares its length,
+    // so the writer below cannot set one without the other.
+    let mut preamble: [u8; FS_PREAMBLE_LEN] = [0u8; FS_PREAMBLE_LEN];
+    let (key, preamble_flag, preamble_len) = match &out.sealing {
+        Sealing::Network => (crypto::network_key(), 0, 0),
+        Sealing::Static => (identity.derive_static_key(&out.recipient)?, 0, 0),
         Sealing::ForwardSecret { ephemeral, prekey } => {
             let key = crypto::seal_key_fs(
                 identity,
@@ -307,29 +369,30 @@ pub fn build(identity: &Identity, out: &Outgoing<'_>) -> Result<Vec<u8>, CoreErr
                 &prekey.public,
                 prekey.generation,
             )?;
-            let preamble = FsPreamble {
-                ephemeral: PublicKey::from(*ephemeral).to_bytes(),
-                generation: prekey.generation,
-            };
-            (key, Some(preamble))
+            preamble[..32].copy_from_slice(PublicKey::from(*ephemeral).as_bytes());
+            preamble[32..36].copy_from_slice(&prekey.generation.to_le_bytes());
+            (key, FLAG_FS, FS_PREAMBLE_LEN)
+        }
+        Sealing::SenderKey {
+            chain_id,
+            index,
+            key,
+        } => {
+            preamble[0..4].copy_from_slice(&chain_id.to_le_bytes());
+            preamble[4..8].copy_from_slice(&index.to_le_bytes());
+            (**key, FLAG_SK, SK_PREAMBLE_LEN)
         }
     };
 
     let mut flags = match out.kind {
         FrameKind::Beacon => FLAG_BEACON,
         FrameKind::Ack => FLAG_ACK,
+        FrameKind::SenderKey => FLAG_SKDM,
         FrameKind::Message => 0,
     };
-    if preamble.is_some() {
-        flags |= FLAG_FS;
-    }
+    flags |= preamble_flag;
 
     let ct_len = out.body.len() + TAG_LEN;
-    let preamble_len = if preamble.is_some() {
-        FS_PREAMBLE_LEN
-    } else {
-        0
-    };
     let mut buf = Vec::with_capacity(HEADER_LEN + preamble_len + nick.len() + ct_len);
 
     buf.push(MAGIC);
@@ -347,10 +410,7 @@ pub fn build(identity: &Identity, out: &Outgoing<'_>) -> Result<Vec<u8>, CoreErr
     buf.extend_from_slice(&nonce);
     debug_assert_eq!(buf.len(), HEADER_LEN);
 
-    if let Some(p) = &preamble {
-        buf.extend_from_slice(&p.ephemeral);
-        buf.extend_from_slice(&p.generation.to_le_bytes());
-    }
+    buf.extend_from_slice(&preamble[..preamble_len]);
 
     // AAD is derived from the bytes just written, with ttl/hops zeroed, so seal
     // and open compute byte-identical AAD.
@@ -383,6 +443,9 @@ pub fn open(
                 fs.generation,
             )?
         }
+        // The caller derived this from the sender chain named in the preamble;
+        // there is no key agreement left to do here.
+        Opening::SenderKey { key } => *key,
     };
     crypto::open_aead(&key, &f.nonce, f.aad(), f.ciphertext)
 }
@@ -585,6 +648,136 @@ mod tests {
         }
     }
 
+    fn sender_key_broadcast<'a>(
+        chain_id: u32,
+        index: u32,
+        key: &'a [u8; 32],
+        body: &'a [u8],
+    ) -> Outgoing<'a> {
+        Outgoing {
+            recipient: crypto::BROADCAST_ID,
+            msg_id: [4u8; 16],
+            epoch: 42,
+            counter: 9,
+            ttl: 4,
+            body,
+            nickname: "",
+            kind: FrameKind::Message,
+            sealing: Sealing::SenderKey {
+                chain_id,
+                index,
+                key,
+            },
+        }
+    }
+
+    #[test]
+    fn a_sender_key_broadcast_roundtrips() {
+        let a = Identity::from_seed([1u8; 32]);
+        let b = Identity::from_seed([2u8; 32]);
+        let key = [0x5Au8; 32];
+
+        let wire = build(
+            &a,
+            &sender_key_broadcast(0xDEADBEEF, 12, &key, b"to the group"),
+        )
+        .unwrap();
+        let p = parse(&wire).unwrap();
+
+        assert!(p.is_broadcast());
+        assert!(
+            p.is_forward_secret(),
+            "a ratcheted broadcast is forward secret"
+        );
+        assert_eq!(
+            p.sk.unwrap(),
+            SkPreamble {
+                chain_id: 0xDEADBEEF,
+                index: 12
+            }
+        );
+        assert!(p.fs.is_none(), "the FS preamble must not also be claimed");
+        assert_eq!(
+            open(&b, &p, Opening::SenderKey { key: &key }).unwrap(),
+            b"to the group"
+        );
+
+        // The group key must not open it — that is the whole point.
+        assert!(open(&b, &p, Opening::Network).is_err());
+        // Nor may a different message key from the same chain.
+        assert!(open(&b, &p, Opening::SenderKey { key: &[0x5Bu8; 32] }).is_err());
+    }
+
+    /// Re-pointing a frame at a different chain or index must break the AEAD
+    /// rather than silently ask the receiver to ratchet somewhere else.
+    #[test]
+    fn the_sender_key_preamble_is_authenticated() {
+        let a = Identity::from_seed([1u8; 32]);
+        let b = Identity::from_seed([2u8; 32]);
+        let key = [0x5Au8; 32];
+        let wire = build(&a, &sender_key_broadcast(7, 3, &key, b"x")).unwrap();
+
+        for offset in HEADER_LEN..HEADER_LEN + SK_PREAMBLE_LEN {
+            let mut tampered = wire.clone();
+            tampered[offset] ^= 0xff;
+            let p = parse(&tampered).unwrap();
+            assert!(
+                open(&b, &p, Opening::SenderKey { key: &key }).is_err(),
+                "tampering with preamble byte {offset} went undetected"
+            );
+        }
+    }
+
+    /// Both preamble bits set is not a frame with a precedence rule; it is a
+    /// frame with two answers to "how long is the header", so it is refused.
+    #[test]
+    fn a_frame_claiming_both_preambles_is_refused() {
+        let a = Identity::from_seed([1u8; 32]);
+        let key = [1u8; 32];
+        let mut wire = build(&a, &sender_key_broadcast(1, 0, &key, b"x")).unwrap();
+        wire[2] |= FLAG_FS;
+        assert_eq!(
+            parse(&wire).unwrap_err(),
+            FrameError::ConflictingPreambles,
+            "an ambiguous length prefix must not be resolved by precedence"
+        );
+    }
+
+    #[test]
+    fn a_truncated_sender_key_preamble_is_rejected() {
+        let a = Identity::from_seed([1u8; 32]);
+        let wire = build(&a, &broadcast(b"x")).unwrap();
+        let mut lying = wire[..HEADER_LEN + 4].to_vec();
+        lying[2] |= FLAG_SK;
+        assert_eq!(parse(&lying).unwrap_err(), FrameError::TooShort);
+    }
+
+    #[test]
+    fn a_sender_key_distribution_is_a_distinct_kind() {
+        let a = Identity::from_seed([1u8; 32]);
+        let b = Identity::from_seed([2u8; 32]);
+        let body = [3u8; crate::senderkey::DISTRIBUTION_LEN];
+        let wire = build(
+            &a,
+            &Outgoing {
+                recipient: b.public_id(),
+                msg_id: [1u8; 16],
+                epoch: 1,
+                counter: 1,
+                ttl: 4,
+                body: &body,
+                nickname: "",
+                kind: FrameKind::SenderKey,
+                sealing: Sealing::Static,
+            },
+        )
+        .unwrap();
+        let p = parse(&wire).unwrap();
+        assert_eq!(p.kind, FrameKind::SenderKey);
+        assert!(!p.is_broadcast(), "a chain key is never broadcast");
+        assert_eq!(open(&b, &p, Opening::Static).unwrap(), body);
+    }
+
     #[test]
     fn relaying_preserves_authenticity() {
         let a = Identity::from_seed([1u8; 32]);
@@ -713,7 +906,7 @@ mod tests {
 
     #[test]
     fn older_wire_versions_are_rejected() {
-        for old in [1u8, 2] {
+        for old in [1u8, 2, 3] {
             let mut v = vec![0u8; 200];
             v[0] = MAGIC;
             v[1] = old;

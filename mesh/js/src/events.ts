@@ -60,9 +60,15 @@ export interface MessageReceivedEvent extends Base {
   hops: number;
   rssi: number;
   /**
-   * False means the sender had no prekey for us and fell back to
-   * static-static: the message is authenticated and encrypted, but **not**
-   * forward secret. Do not show a guarantee the transport did not give you.
+   * True when the sender used a ratcheting key that has since been erased —
+   * the prekey exchange for a directed message, the sender-key chain for a
+   * broadcast.
+   *
+   * False means it fell back to a long-lived key: static-static because the
+   * sender had no prekey for us, or the group key because the sender had no
+   * peer holding its chain yet. Either way the message is authenticated and
+   * encrypted, but **not** forward secret. Do not show a guarantee the
+   * transport did not give you.
    */
   forwardSecret: boolean;
   /** Zero-copy view over the decrypted plaintext. */

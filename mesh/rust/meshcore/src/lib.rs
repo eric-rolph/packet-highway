@@ -25,7 +25,7 @@
 //! Rust stays the brain; the platform is a dumb pipe. That is also the split
 //! that keeps 95% of the logic host-testable.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -36,6 +36,7 @@ pub mod frame;
 pub mod outbox;
 pub mod prekey;
 pub mod replay;
+pub mod senderkey;
 
 pub use crypto::{Identity, PeerId};
 pub use event::{Event, EventKind};
@@ -43,6 +44,7 @@ pub use frame::{FrameError, FrameKind, ParsedFrame};
 pub use outbox::Outbox;
 pub use prekey::{PeerPrekey, PrekeyRing};
 pub use replay::{ReplayVerdict, ReplayWindow};
+pub use senderkey::{ChainStore, SenderChain};
 
 /// Bumped whenever the C ABI or the binary event layout changes. The native
 /// layer asserts this at install time so a stale `.so` can never silently
@@ -236,6 +238,9 @@ impl MeshCore {
             outbox_len: outbox_len.clone(),
             prekeys: PrekeyRing::new(now_ms())?,
             peer_prekeys: HashMap::new(),
+            sender_chain: SenderChain::new()?,
+            chains: ChainStore::default(),
+            chain_shared_with: HashSet::new(),
             replay: HashMap::new(),
             seen: VecDeque::with_capacity(DEDUP_CAPACITY),
             seen_set: HashMap::new(),
@@ -380,6 +385,13 @@ struct Worker {
     prekeys: PrekeyRing,
     /// Prekeys advertised by peers, after signature verification.
     peer_prekeys: HashMap<PeerId, PeerPrekey>,
+    /// Our broadcast chain, ratcheted once per broadcast.
+    sender_chain: SenderChain,
+    /// Peers' broadcast chains, as distributed to us.
+    chains: ChainStore,
+    /// Peers we have handed our current chain to. Empty means nobody could read
+    /// a ratcheted broadcast yet, so we fall back to the group key.
+    chain_shared_with: HashSet<PeerId>,
     replay: HashMap<PeerId, ReplayWindow>,
     seen: VecDeque<[u8; 16]>,
     seen_set: HashMap<[u8; 16], u64>,
@@ -504,11 +516,16 @@ impl Worker {
 
     /// Seal a frame, choosing the strongest key agreement available.
     ///
-    /// Broadcasts use the group key. Directed frames use the forward-secret
-    /// path when we hold a verified prekey for the recipient, and fall back to
-    /// static-static when we do not — sending something the recipient can read
-    /// beats refusing, and the receiver is told which it got so the UI need not
-    /// imply a guarantee that is absent.
+    /// Directed frames use the forward-secret prekey path when we hold a
+    /// verified prekey for the recipient, and fall back to static-static when we
+    /// do not — sending something the recipient can read beats refusing, and the
+    /// receiver is told which it got so the UI need not imply a guarantee that
+    /// is absent.
+    ///
+    /// Broadcasts use the sender-key ratchet once at least one peer holds our
+    /// chain, and the group key before that. Beacons are always group-sealed:
+    /// they carry the prekey bundle a peer needs to *receive* a chain, so
+    /// sealing them to a chain would be a bootstrap that requires itself.
     ///
     /// A message queued before we learned the recipient's prekey keeps the
     /// fallback sealing for its retries: the outbox stores sealed bytes on
@@ -535,6 +552,22 @@ impl Worker {
         };
 
         if recipient == crypto::BROADCAST_ID {
+            if kind == FrameKind::Beacon || self.chain_shared_with.is_empty() {
+                return frame::build(&self.identity, &out);
+            }
+            // Taking the key advances the chain and erases what produced it,
+            // whether or not the frame ever reaches the air. That is the
+            // intended direction to fail in: a key too few, never one reused.
+            let chain_id = self.sender_chain.chain_id();
+            let (key, index) = self
+                .sender_chain
+                .next_message_key()
+                .ok_or(CoreError::Crypto("sender chain exhausted"))?;
+            out.sealing = frame::Sealing::SenderKey {
+                chain_id,
+                index,
+                key: &key,
+            };
             return frame::build(&self.identity, &out);
         }
 
@@ -612,9 +645,29 @@ impl Worker {
     /// The choice is driven entirely by authenticated header bits, so an
     /// attacker cannot downgrade us onto a weaker key: flipping `FLAG_FS` or
     /// the prekey generation changes the AAD and the AEAD fails.
-    fn unseal(&self, parsed: &ParsedFrame<'_>) -> Result<Vec<u8>, CoreError> {
+    fn unseal(&mut self, parsed: &ParsedFrame<'_>) -> Result<Vec<u8>, CoreError> {
         if parsed.is_broadcast() {
-            return frame::open(&self.identity, parsed, frame::Opening::Network);
+            let Some(sk) = parsed.sk else {
+                return frame::open(&self.identity, parsed, frame::Opening::Network);
+            };
+            // Disjoint field borrows: `chains` mutably, `identity` shared.
+            let chain = self
+                .chains
+                .get_mut(&parsed.sender, sk.chain_id)
+                .ok_or(CoreError::Crypto("no sender key for this chain"))?;
+            let derived = chain
+                .derive(sk.index)
+                .ok_or(CoreError::Crypto("sender key index out of range"))?;
+            let plaintext = frame::open(
+                &self.identity,
+                parsed,
+                frame::Opening::SenderKey { key: &derived.key },
+            )?;
+            // Only now. Committing before the AEAD verified would let anyone
+            // put a frame on the air that ratchets us past the real sender's
+            // messages and destroys the keys for them.
+            chain.commit(derived);
+            return Ok(plaintext);
         }
         match &parsed.fs {
             Some(fs) => {
@@ -674,19 +727,37 @@ impl Worker {
                 // prekey under someone else's name and collect their mail.
                 if let Some(bundle) = prekey::parse_bundle(&parsed.sender, &plaintext) {
                     let entry = self.peer_prekeys.entry(parsed.sender);
-                    match entry {
+                    let installed = match entry {
                         std::collections::hash_map::Entry::Occupied(mut o) => {
                             // Only move forward. Accepting an older generation
                             // would let a captured beacon pin a peer to a
                             // prekey whose secret is closer to expiry.
                             if bundle.generation > o.get().generation {
                                 o.insert(bundle);
+                                true
+                            } else {
+                                false
                             }
                         }
                         std::collections::hash_map::Entry::Vacant(v) => {
                             v.insert(bundle);
+                            true
                         }
+                    };
+                    // A fresh prekey is both the first chance and every later
+                    // chance to hand this peer our broadcast chain. Riding the
+                    // rotation means a lost distribution self-heals within one
+                    // `prekey::ROTATE_INTERVAL_MS` instead of never.
+                    if installed {
+                        self.send_sender_key(&parsed.sender)?;
                     }
+                }
+            }
+            FrameKind::SenderKey => {
+                // Authenticity comes from the frame: it was sealed to us by
+                // this sender, so the chain it carries is theirs to announce.
+                if let Some(dist) = senderkey::parse_distribution(&plaintext) {
+                    self.chains.install(parsed.sender, &dist);
                 }
             }
             FrameKind::Ack => {
@@ -722,6 +793,29 @@ impl Worker {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Hand one peer our broadcast chain, over the directed forward-secret path.
+    ///
+    /// This frame is the hinge of the whole construction: it is the only place
+    /// a chain key travels, and it must never be broadcast. Sealed under a
+    /// prekey that will be zeroized minutes from now, it is what stops a
+    /// recorded session from being decrypted by a later device seizure.
+    ///
+    /// We send the chain *as it stands*, so the peer reads from here on and
+    /// nothing before — no retroactive access for someone who just walked in.
+    fn send_sender_key(&mut self, to: &PeerId) -> Result<(), CoreError> {
+        if !self.running.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let dist = self.sender_chain.distribution();
+        let wire = self.seal(*to, crypto::random_16()?, &dist, FrameKind::SenderKey)?;
+        self.transmit(to, &wire);
+        // Recorded even if the frame is lost on the air: the retry is the next
+        // prekey rotation, and until then falling back to the group key for
+        // broadcasts would be a downgrade, not a repair.
+        self.chain_shared_with.insert(*to);
         Ok(())
     }
 
@@ -1275,21 +1369,162 @@ mod tests {
         assert_eq!(b.sink.fs_flags(), vec![false], "fallback must not claim FS");
     }
 
-    /// A broadcast is readable by every member and can never be forward secret;
-    /// the flag has to reflect that rather than defaulting to true.
+    /// A node with nobody to hand its chain to has only the group key, and must
+    /// say so rather than defaulting the flag to true.
     #[test]
-    fn broadcasts_are_never_marked_forward_secret() {
+    fn a_broadcast_before_any_chain_is_distributed_is_not_forward_secret() {
         let a = node("alice", 1);
         let b = node("bob", 2);
         a.core.start_broadcasting().unwrap();
         b.core.start_broadcasting().unwrap();
         settle();
 
+        // A has not heard B's beacon, so A has distributed its chain to nobody.
+        b.radio.drain();
+
         a.core.send_message(None, b"everyone").unwrap();
         settle();
         deliver(&a, &b);
 
-        assert_eq!(b.sink.fs_flags(), vec![false]);
+        assert_eq!(b.sink.bodies(), vec![b"everyone".to_vec()]);
+        assert_eq!(b.sink.fs_flags(), vec![false], "group key, and admits it");
+    }
+
+    /// Give A and B a chance to exchange beacons and sender keys.
+    fn introduce(a: &Node, b: &Node) {
+        deliver(a, b);
+        deliver(b, a);
+        deliver(a, b);
+        deliver(b, a);
+        a.radio.drain();
+        b.radio.drain();
+    }
+
+    /// The headline of this increment: once a peer holds our chain, broadcasts
+    /// stop being sealed under the constant-derived group key.
+    #[test]
+    fn broadcasts_become_forward_secret_once_a_peer_holds_the_chain() {
+        let a = node("alice", 1);
+        let b = node("bob", 2);
+        a.core.start_broadcasting().unwrap();
+        b.core.start_broadcasting().unwrap();
+        settle();
+        introduce(&a, &b);
+
+        a.core.send_message(None, b"ratcheted").unwrap();
+        settle();
+        deliver(&a, &b);
+
+        assert_eq!(b.sink.bodies(), vec![b"ratcheted".to_vec()]);
+        assert_eq!(
+            b.sink.fs_flags(),
+            vec![true],
+            "a distributed chain must be used"
+        );
+    }
+
+    /// The chain key is the one secret that would undo everything if it were
+    /// broadcast. It must only ever leave over a directed, forward-secret frame.
+    #[test]
+    fn a_chain_key_is_never_broadcast() {
+        let a = node("alice", 1);
+        let b = node("bob", 2);
+        a.core.start_broadcasting().unwrap();
+        b.core.start_broadcasting().unwrap();
+        settle();
+
+        deliver(&b, &a); // A learns B's prekey and distributes its chain
+
+        let mut seen_distribution = false;
+        for wire in a.radio.drain() {
+            let p = frame::parse(&wire).unwrap();
+            if p.kind != FrameKind::SenderKey {
+                continue;
+            }
+            seen_distribution = true;
+            assert!(!p.is_broadcast(), "a chain key was put on the air for all");
+            assert!(
+                p.is_forward_secret(),
+                "a chain key must not ride the static fallback"
+            );
+        }
+        assert!(seen_distribution, "A should have distributed its chain");
+    }
+
+    /// Sender keys are per-sender by construction: a node that never received
+    /// the distribution cannot read the broadcast, even though it is a member
+    /// of the mesh and holds the group key.
+    #[test]
+    fn a_peer_without_the_chain_cannot_read_a_ratcheted_broadcast() {
+        let a = node("alice", 1);
+        let b = node("bob", 2);
+        let c = node("carol", 3);
+        for n in [&a, &b, &c] {
+            n.core.start_broadcasting().unwrap();
+        }
+        settle();
+
+        // C is a fully paid-up mesh member: it has A's beacon and the group
+        // key. What it does not have is A's chain, because A never heard C.
+        deliver(&a, &c);
+        assert!(
+            c.sink.count(event::KIND_PEER_DISCOVERED) >= 1,
+            "precondition: C can see A"
+        );
+        introduce(&a, &b);
+
+        a.core.send_message(None, b"not for carol").unwrap();
+        settle();
+        deliver(&a, &c);
+
+        assert!(
+            c.sink.bodies().is_empty(),
+            "the group key must not open a ratcheted broadcast"
+        );
+    }
+
+    /// BLE reorders. The skip cache has to make that survivable, or the ratchet
+    /// would trade confidentiality for dropped messages.
+    #[test]
+    fn reordered_ratcheted_broadcasts_all_decode() {
+        let a = node("alice", 1);
+        let b = node("bob", 2);
+        a.core.start_broadcasting().unwrap();
+        b.core.start_broadcasting().unwrap();
+        settle();
+        introduce(&a, &b);
+
+        for body in [b"one".as_slice(), b"two", b"three"] {
+            a.core.send_message(None, body).unwrap();
+        }
+        settle();
+
+        let mut messages: Vec<_> = a
+            .radio
+            .drain()
+            .into_iter()
+            .filter(|w| {
+                frame::parse(w)
+                    .map(|p| p.kind == FrameKind::Message)
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert_eq!(messages.len(), 3);
+        messages.reverse();
+
+        for wire in messages {
+            b.core.ingest(-55, &wire).unwrap();
+        }
+        settle();
+
+        let mut bodies = b.sink.bodies();
+        bodies.sort();
+        assert_eq!(
+            bodies,
+            vec![b"one".to_vec(), b"three".to_vec(), b"two".to_vec()],
+            "out-of-order arrival must not cost a message"
+        );
+        assert_eq!(b.sink.fs_flags(), vec![true; 3]);
     }
 
     /// A peer that impersonates another in a beacon must not be able to install

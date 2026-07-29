@@ -37,11 +37,33 @@
 //! they otherwise could, since beacons are only authenticated by the shared
 //! network key.
 //!
+//! ## Broadcasts: a sender-key ratchet
+//!
+//! A broadcast has no single recipient, so there is no pairwise exchange to be
+//! forward secret about. Instead each node runs one **sender chain**: a random
+//! 32-byte chain key, ratcheted once per broadcast.
+//!
+//! ```text
+//! mk_i     = KDF(ck_i, "sk-message")   <- seals broadcast i
+//! ck_{i+1} = KDF(ck_i, "sk-chain")     <- replaces ck_i, which is then erased
+//! ```
+//!
+//! The ratchet is one-way, so possessing `ck_n` says nothing about `ck_{n-1}`.
+//! What makes that *worth* anything is how the chain reaches the group: the
+//! chain key is handed to each peer in a **directed, forward-secret** frame over
+//! the prekey path above — never in a beacon. An attacker who records the whole
+//! session and later seizes the device gets neither the retired prekeys that
+//! would open the distribution frames nor the spent chain keys that would open
+//! the broadcasts.
+//!
+//! That is the property the group key never had: [`network_key`] is derived from
+//! a constant, so one stolen channel secret decrypted every broadcast ever
+//! recorded. See `senderkey.rs` for the ratchet and its limits.
+//!
 //! ## What is still not forward secret
 //!
-//! * **Broadcasts.** They are sealed with a group key every member holds; there
-//!   is no per-recipient exchange to be forward secret about. A sender-keys
-//!   ratchet would fix this and is the natural next step.
+//! * **Broadcasts sent before any sender key has been distributed** — a node
+//!   with no peers yet still falls back to [`network_key`], with the flag clear.
 //! * **Directed messages to a peer whose prekey we have never seen.** Rather
 //!   than refuse to send, the frame falls back to static-static and sets no
 //!   `FLAG_FS`; the receiver reports `forward_secret: false` on the event so the
@@ -75,13 +97,13 @@ pub const SIGNATURE_LEN: usize = 64;
 
 /// Domain separator baked into every derived key. Change it and old builds can
 /// no longer talk to new ones — which is the point during protocol migrations.
-const KDF_DOMAIN: &[u8] = b"meshcore/v3/ed25519-x25519-chacha20poly1305";
+const KDF_DOMAIN: &[u8] = b"meshcore/v4/ed25519-x25519-chacha20poly1305";
 /// Placeholder channel secret for the public mesh. In production this is the
 /// per-channel secret the user joined with, not a constant.
-const CHANNEL_SECRET: &[u8] = b"meshcore/v3/public-channel";
+const CHANNEL_SECRET: &[u8] = b"meshcore/v4/public-channel";
 /// Signed alongside a prekey so a signature can never be replayed as anything
 /// other than a prekey announcement.
-const PREKEY_DOMAIN: &[u8] = b"meshcore/v3/prekey";
+const PREKEY_DOMAIN: &[u8] = b"meshcore/v4/prekey";
 
 /// Long-term identity. `Clone` is cheap and needed because the worker thread
 /// owns a copy.
@@ -274,13 +296,43 @@ pub fn open_key_fs(
     Ok(fs_key(&dh1, &dh2, sender, recipient, generation))
 }
 
-/// Group key for broadcast traffic. Not forward secret — see the module note.
+/// Group key for broadcast traffic.
+///
+/// Derived from a constant, so it is **not** forward secret and never can be:
+/// whoever learns the channel secret reads every broadcast ever recorded under
+/// it. It survives as the bootstrap key — beacons must be readable by a peer
+/// that holds nothing yet — and as the fallback for a node with no peers to
+/// distribute a sender key to. Everything else uses [`sender_chain_step`].
 pub fn network_key() -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(KDF_DOMAIN);
     h.update(b"\x02broadcast");
     h.update(CHANNEL_SECRET);
     h.finalize().into()
+}
+
+/// One click of a sender chain: `(message_key, next_chain_key)`.
+///
+/// Two independent derivations from the same input, under different domain
+/// tags. That separation is what makes it safe to hand the message key to the
+/// AEAD while keeping the chain alive: recovering `ck_i` from `mk_i` would mean
+/// inverting SHA-256, so a leaked message key compromises exactly one broadcast.
+///
+/// The caller **must** overwrite `ck_i` with the returned chain key and erase
+/// the old one. The ratchet is not the security property on its own — the
+/// erasure is; see `senderkey.rs`.
+pub fn sender_chain_step(chain: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
+    let mut mk = Sha256::new();
+    mk.update(KDF_DOMAIN);
+    mk.update(b"\x04sk-message");
+    mk.update(chain);
+
+    let mut next = Sha256::new();
+    next.update(KDF_DOMAIN);
+    next.update(b"\x05sk-chain");
+    next.update(chain);
+
+    (mk.finalize().into(), next.finalize().into())
 }
 
 // ---------------------------------------------------------------------------
@@ -318,6 +370,18 @@ pub fn random_16() -> Result<[u8; 16], CoreError> {
     let mut b = [0u8; 16];
     getrandom::getrandom(&mut b).map_err(|_| CoreError::Crypto("getrandom failed"))?;
     Ok(b)
+}
+
+pub fn random_32() -> Result<[u8; 32], CoreError> {
+    let mut b = [0u8; 32];
+    getrandom::getrandom(&mut b).map_err(|_| CoreError::Crypto("getrandom failed"))?;
+    Ok(b)
+}
+
+pub fn random_u32() -> Result<u32, CoreError> {
+    let mut b = [0u8; 4];
+    getrandom::getrandom(&mut b).map_err(|_| CoreError::Crypto("getrandom failed"))?;
+    Ok(u32::from_le_bytes(b))
 }
 
 pub fn random_nonce() -> Result<[u8; NONCE_LEN], CoreError> {
@@ -480,6 +544,32 @@ mod tests {
         assert!(!verify_prekey(&alice.public_id(), 3, &[8u8; 32], &sig));
         // ...or a different generation.
         assert!(!verify_prekey(&alice.public_id(), 4, &prekey, &sig));
+    }
+
+    /// The two outputs must be independent of each other and of the input, or
+    /// handing the message key to the AEAD would leak the chain.
+    #[test]
+    fn a_chain_step_produces_two_unrelated_keys() {
+        let ck = [7u8; 32];
+        let (mk, next) = sender_chain_step(&ck);
+        assert_ne!(mk, next);
+        assert_ne!(mk, ck);
+        assert_ne!(next, ck);
+        // Deterministic: both sides of a broadcast must land on the same key.
+        assert_eq!(sender_chain_step(&ck), (mk, next));
+    }
+
+    /// Walking the chain must never revisit a message key — every broadcast
+    /// gets its own, and a repeat would be nonce-reuse-shaped.
+    #[test]
+    fn a_chain_never_repeats_a_message_key() {
+        let mut ck = [3u8; 32];
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..256 {
+            let (mk, next) = sender_chain_step(&ck);
+            assert!(seen.insert(mk), "message key repeated within one chain");
+            ck = next;
+        }
     }
 
     #[test]

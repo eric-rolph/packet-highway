@@ -29,8 +29,9 @@ mesh.initialize({ nickname: 'ada' });
 
 mesh.on('peerDiscovered', (e) => console.log('saw', e.nickname, e.rssi));
 mesh.on('messageReceived', (e) =>
-  // `forwardSecret` is false when the sender had no prekey for us and fell
-  // back to static-static. Show the difference; don't imply the guarantee.
+  // `forwardSecret` is false when the sender fell back to a long-lived key:
+  // static-static (no prekey for us) or the group key (no peer held its sender
+  // chain yet). Show the difference; don't imply the guarantee.
   console.log(peerIdToHex(e.sender), e.forwardSecret ? '🔒' : '⚠️',
               new TextDecoder().decode(e.body)),
 );
@@ -55,7 +56,8 @@ js/       thin API + binary event decoder
 shared/cpp/   one JSI HostObject, compiled by BOTH platforms
   ↕ C ABI (cbindgen-generated header)
 rust/meshcore-ffi/   the only crate with #[no_mangle]
-rust/meshcore/       pure Rust: framing, Ed25519 identity + X3DH forward secrecy,
+rust/meshcore/       pure Rust: framing, Ed25519 identity, X3DH forward secrecy
+                     for directed mail + ratcheting sender keys for broadcasts,
                      ChaCha20-Poly1305, flood routing, anti-replay window,
                      store-and-forward outbox
   ↕ PlatformRadio trait (injected)
