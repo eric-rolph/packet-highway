@@ -663,6 +663,13 @@ differences) long before a device build would.
 `RUSTFLAGS`, because cargo applies `RUSTFLAGS` to dependency crates too and one
 warning in a transitive dependency would then fail the build.
 
+One thing to expect: the `rust` job uses `dtolnay/rust-toolchain@stable`, so **a
+clean local clippy does not mean a clean CI clippy** if your toolchain is older.
+That is not hypothetical — the sender-key work passed clippy 0.1.94 locally and
+failed on 0.1.97 in CI over a style lint that had been broadened in between.
+`rustup update` before pushing, or expect one red run. Pinning CI to a fixed
+toolchain would make the two agree, at the cost of never seeing new lints.
+
 ## 9. What is scaffolding, and what to do next
 
 Honest inventory of what is *not* production-ready:

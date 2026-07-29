@@ -221,7 +221,7 @@ pub struct InboundChain {
 impl Drop for InboundChain {
     fn drop(&mut self) {
         self.key.zeroize();
-        for (_, k) in self.skipped.iter_mut() {
+        for k in self.skipped.values_mut() {
             k.zeroize();
         }
     }
