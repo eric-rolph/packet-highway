@@ -44,6 +44,19 @@
 //! immediately, an attacker could skip us past the real sender's messages and
 //! destroy the keys for them. [`InboundChain::derive`] computes against a copy
 //! and returns a [`Derived`] the caller commits only after decryption succeeds.
+//!
+//! ## Ratcheting is not recovery
+//!
+//! The ratchet shuts the past and nothing else. `ck_{i+1}` is computable from
+//! `ck_i`, so an attacker who takes a chain key reads every broadcast that
+//! sender makes from then on — forever, if the chain lives as long as the
+//! session does.
+//!
+//! Recovery needs entropy the attacker does not have, so the chain is **thrown
+//! away and regenerated** every [`ROTATE_INTERVAL_MS`], and the fresh one is
+//! redistributed over the prekey path immediately. That bounds a stolen chain to
+//! one interval instead of one session. Rotation is a replacement, not a step:
+//! stepping would leave the new key derivable from the old.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
@@ -67,28 +80,48 @@ pub const MAX_SKIP: u32 = 64;
 /// a memory one.
 pub const SKIPPED_CAP: usize = 128;
 
-/// Chains retained per peer. A peer that restarts announces a fresh `chain_id`;
-/// keeping one previous chain lets its last few in-flight broadcasts land, and
-/// evicting beyond that erases the old chain key.
+/// Chains retained per peer. A peer that restarts — or rotates, below —
+/// announces a fresh `chain_id`; keeping one previous chain lets its last few
+/// in-flight broadcasts land, and evicting beyond that erases the old chain key.
 pub const CHAINS_PER_PEER: usize = 2;
+
+/// How long a chain is used before it is replaced outright.
+///
+/// The ratchet gives forward secrecy — old broadcasts stay shut. It gives no
+/// *post-compromise* security: a stolen chain key opens every broadcast the
+/// sender makes from then on, because `ck_{i+1}` is computable from `ck_i`.
+/// Replacing the chain with fresh randomness is the only thing that recovers,
+/// and this interval is therefore the exposure bound.
+///
+/// Deliberately equal to `prekey::ROTATE_INTERVAL_MS`: the two together set the
+/// post-compromise window, and whichever is longer is the real bound, so letting
+/// them drift would silently make one of them decorative.
+/// `chain_rotation_matches_prekey_rotation` pins that.
+///
+/// The cost is a burst of one directed frame per known peer at each rotation.
+/// `Config::chain_rotate_ms` exists so a deployment with many peers per node can
+/// trade window for traffic.
+pub const ROTATE_INTERVAL_MS: u64 = 60_000;
 
 // ---------------------------------------------------------------------------
 // Outbound
 // ---------------------------------------------------------------------------
 
-/// Our own broadcast chain. One per session.
+/// Our own broadcast chain.
 pub struct SenderChain {
     chain_id: u32,
     index: u32,
     key: [u8; 32],
+    started_ms: u64,
 }
 
 impl SenderChain {
-    pub fn new() -> Result<Self, CoreError> {
+    pub fn new(now_ms: u64) -> Result<Self, CoreError> {
         Ok(Self {
             chain_id: crypto::random_u32()?,
             index: 0,
             key: crypto::random_32()?,
+            started_ms: now_ms,
         })
     }
 
@@ -98,6 +131,14 @@ impl SenderChain {
 
     pub fn index(&self) -> u32 {
         self.index
+    }
+
+    /// Whether this chain has outlived `interval_ms` and should be replaced.
+    ///
+    /// Replaced, not ratcheted: the point is to introduce randomness an attacker
+    /// holding the old key cannot derive.
+    pub fn is_due(&self, now_ms: u64, interval_ms: u64) -> bool {
+        now_ms.saturating_sub(self.started_ms) >= interval_ms
     }
 
     /// Take the next message key and advance, erasing the key that produced it.
@@ -401,7 +442,7 @@ mod tests {
 
     #[test]
     fn a_distribution_round_trips() {
-        let chain = SenderChain::new().unwrap();
+        let chain = SenderChain::new(0).unwrap();
         let d = parse_distribution(&chain.distribution()).unwrap();
         assert_eq!(d.chain_id, chain.chain_id());
         assert_eq!(d.index, 0);
@@ -413,7 +454,7 @@ mod tests {
 
     #[test]
     fn sender_and_receiver_agree_in_order() {
-        let mut sender = SenderChain::new().unwrap();
+        let mut sender = SenderChain::new(0).unwrap();
         let mut rx = receiver(&sender);
         for (index, expected) in broadcast_n(&mut sender, 8) {
             let d = rx.derive(index).expect("in-order index must derive");
@@ -428,7 +469,7 @@ mod tests {
     /// then the gap fills in.
     #[test]
     fn a_skipped_frame_can_still_be_opened_when_it_arrives() {
-        let mut sender = SenderChain::new().unwrap();
+        let mut sender = SenderChain::new(0).unwrap();
         // Snapshot the chain before it advances — a peer that joins later would
         // legitimately start further along, which is a different test.
         let mut rx = receiver(&sender);
@@ -454,7 +495,7 @@ mod tests {
     /// archive of openable messages.
     #[test]
     fn a_used_skipped_key_cannot_be_used_twice() {
-        let mut sender = SenderChain::new().unwrap();
+        let mut sender = SenderChain::new(0).unwrap();
         let mut rx = receiver(&sender);
         let sent = broadcast_n(&mut sender, 3);
 
@@ -470,7 +511,7 @@ mod tests {
 
     #[test]
     fn an_index_beyond_max_skip_is_refused() {
-        let sender = SenderChain::new().unwrap();
+        let sender = SenderChain::new(0).unwrap();
         let rx = receiver(&sender);
         assert!(rx.derive(MAX_SKIP).is_some(), "the boundary itself is fine");
         assert!(rx.derive(MAX_SKIP + 1).is_none());
@@ -482,7 +523,7 @@ mod tests {
     /// sender's messages and destroy their keys.
     #[test]
     fn deriving_without_committing_leaves_the_chain_untouched() {
-        let mut sender = SenderChain::new().unwrap();
+        let mut sender = SenderChain::new(0).unwrap();
         let mut rx = receiver(&sender);
         let sent = broadcast_n(&mut sender, 3);
 
@@ -503,7 +544,7 @@ mod tests {
 
     #[test]
     fn the_skip_cache_is_bounded() {
-        let mut sender = SenderChain::new().unwrap();
+        let mut sender = SenderChain::new(0).unwrap();
         let mut rx = receiver(&sender);
         // Jump MAX_SKIP at a time until well past the cap.
         let mut index = 0u32;
@@ -526,8 +567,62 @@ mod tests {
     /// Rewinding would restore chain keys we had erased. A replayed old
     /// distribution must not be able to do that.
     #[test]
+    fn a_chain_becomes_due_only_after_the_interval() {
+        let chain = SenderChain::new(1_000).unwrap();
+        assert!(!chain.is_due(1_000, ROTATE_INTERVAL_MS));
+        assert!(!chain.is_due(1_000 + ROTATE_INTERVAL_MS - 1, ROTATE_INTERVAL_MS));
+        assert!(chain.is_due(1_000 + ROTATE_INTERVAL_MS, ROTATE_INTERVAL_MS));
+        // A clock that jumps backwards must not make a chain immortal.
+        assert!(!chain.is_due(0, ROTATE_INTERVAL_MS));
+    }
+
+    /// Rotation has to be a *replacement*. Stepping the chain would leave the
+    /// new key derivable from the old one, which is precisely what an attacker
+    /// holding the old one can already do — no recovery at all.
+    #[test]
+    fn a_rotated_chain_is_not_derivable_from_the_old_one() {
+        let mut old = SenderChain::new(0).unwrap();
+        let old_id = old.chain_id();
+        // Walk the old chain forward as far as an attacker could.
+        let mut attacker_view = receiver(&old);
+        broadcast_n(&mut old, 4);
+
+        let new = SenderChain::new(ROTATE_INTERVAL_MS).unwrap();
+        assert_ne!(new.chain_id(), old_id, "a new chain needs a new id");
+        assert_eq!(new.index(), 0);
+
+        // Everything the attacker can reach from the old chain, against the new
+        // chain's first message key.
+        let (fresh_mk, _) = crypto::sender_chain_step(&{
+            let d = parse_distribution(&new.distribution()).unwrap();
+            d.key
+        });
+        for i in 0..MAX_SKIP {
+            if let Some(d) = attacker_view.derive(i) {
+                assert_ne!(
+                    d.key, fresh_mk,
+                    "old chain reached the new chain's key at index {i}"
+                );
+                attacker_view.commit(d);
+            }
+        }
+    }
+
+    /// The two rotation intervals jointly set the post-compromise window, so the
+    /// longer one is the real bound. Tuning one without the other would make the
+    /// other decorative.
+    #[test]
+    fn chain_rotation_matches_prekey_rotation() {
+        assert_eq!(
+            ROTATE_INTERVAL_MS,
+            crate::prekey::ROTATE_INTERVAL_MS,
+            "chain and prekey rotation must be tuned together"
+        );
+    }
+
+    #[test]
     fn a_distribution_cannot_rewind_a_chain() {
-        let mut sender = SenderChain::new().unwrap();
+        let mut sender = SenderChain::new(0).unwrap();
         let early = parse_distribution(&sender.distribution()).unwrap();
         broadcast_n(&mut sender, 5);
         let later = parse_distribution(&sender.distribution()).unwrap();
@@ -549,7 +644,7 @@ mod tests {
         let mut store = ChainStore::default();
         let mut ids = Vec::new();
         for _ in 0..CHAINS_PER_PEER + 3 {
-            let chain = SenderChain::new().unwrap();
+            let chain = SenderChain::new(0).unwrap();
             let d = parse_distribution(&chain.distribution()).unwrap();
             ids.push(d.chain_id);
             store.install(PEER, &d);
@@ -565,7 +660,7 @@ mod tests {
     fn an_unknown_chain_is_not_openable() {
         let mut store = ChainStore::default();
         assert!(store.get_mut(&PEER, 1234).is_none());
-        let chain = SenderChain::new().unwrap();
+        let chain = SenderChain::new(0).unwrap();
         let d = parse_distribution(&chain.distribution()).unwrap();
         store.install(PEER, &d);
         assert!(store.get_mut(&PEER, d.chain_id.wrapping_add(1)).is_none());

@@ -138,6 +138,11 @@ pub struct Config {
     /// wall clock at construction; pass a persisted boot counter if you have
     /// one (see `replay.rs` for why that is better).
     pub epoch: Option<u64>,
+    /// How long a broadcast sender chain lives before it is replaced and
+    /// redistributed. This is the post-compromise exposure window for
+    /// broadcasts, traded against one directed frame per peer per rotation —
+    /// a real deployment knob, not a constant in disguise. See `senderkey.rs`.
+    pub chain_rotate_ms: u64,
 }
 
 impl Default for Config {
@@ -147,6 +152,7 @@ impl Default for Config {
             identity_seed: None,
             ttl: DEFAULT_TTL,
             epoch: None,
+            chain_rotate_ms: senderkey::ROTATE_INTERVAL_MS,
         }
     }
 }
@@ -238,7 +244,7 @@ impl MeshCore {
             outbox_len: outbox_len.clone(),
             prekeys: PrekeyRing::new(now_ms())?,
             peer_prekeys: HashMap::new(),
-            sender_chain: SenderChain::new()?,
+            sender_chain: SenderChain::new(now_ms())?,
             chains: ChainStore::default(),
             chain_shared_with: HashSet::new(),
             replay: HashMap::new(),
@@ -819,6 +825,34 @@ impl Worker {
         Ok(())
     }
 
+    /// Throw the broadcast chain away and hand every peer a fresh one.
+    ///
+    /// This is what gives broadcasts post-compromise security. The ratchet
+    /// cannot: `ck_{i+1}` follows from `ck_i`, so a stolen chain reads forward
+    /// forever. Only randomness the attacker never saw recovers, so the chain is
+    /// **replaced**, not stepped.
+    ///
+    /// `chain_shared_with` is cleared and refilled inside one call. That matters:
+    /// while it is empty, `seal` would fall back to the group key, and a
+    /// rotation that downgraded every broadcast in the gap would be worse than
+    /// not rotating. The worker is single-threaded, so no broadcast can be sealed
+    /// between the clear and the re-sends.
+    ///
+    /// A peer that misses its copy reads nothing from us until the next
+    /// beacon-triggered redistribution — the same one-interval hole §9 already
+    /// records for a lost distribution, not a new failure mode.
+    fn rotate_sender_chain(&mut self, now: u64) -> Result<(), CoreError> {
+        // The old chain's key is zeroized as it drops.
+        self.sender_chain = SenderChain::new(now)?;
+        self.chain_shared_with.clear();
+
+        let peers: Vec<PeerId> = self.peer_prekeys.keys().copied().collect();
+        for peer in peers {
+            self.send_sender_key(&peer)?;
+        }
+        Ok(())
+    }
+
     fn send_ack(&mut self, to: &PeerId, acked: [u8; 16]) -> Result<(), CoreError> {
         let wire = self.seal(*to, crypto::random_16()?, &acked, FrameKind::Ack)?;
         self.transmit(to, &wire);
@@ -863,6 +897,15 @@ impl Worker {
             }
         }
         self.sync_outbox_len();
+
+        // Replacing the broadcast chain bounds how long a stolen one keeps
+        // reading. Cheap when nobody holds our chain yet — the redistribution
+        // loop is over `peer_prekeys`, which is empty on a node with no peers.
+        if self.sender_chain.is_due(now, self.config.chain_rotate_ms) {
+            if let Err(e) = self.rotate_sender_chain(now) {
+                self.emit(Event::error(self.tick_seq(), &e.to_string()));
+            }
+        }
 
         // Rotating retires the prekey peers are currently addressing, so the
         // beacon has to go out immediately — otherwise senders keep using a
@@ -1078,6 +1121,11 @@ mod tests {
     }
 
     fn node(nickname: &str, seed: u8) -> Node {
+        // The production interval, so no other test is silently rotating.
+        node_with(nickname, seed, senderkey::ROTATE_INTERVAL_MS)
+    }
+
+    fn node_with(nickname: &str, seed: u8, chain_rotate_ms: u64) -> Node {
         let radio = Arc::new(NullRadio::default());
         let sink = Arc::new(CollectSink::default());
         let core = MeshCore::new(
@@ -1086,6 +1134,7 @@ mod tests {
                 identity_seed: Some([seed; 32]),
                 ttl: 4,
                 epoch: Some(1),
+                chain_rotate_ms,
             },
             radio.clone(),
             sink.clone(),
@@ -1480,6 +1529,80 @@ mod tests {
         assert!(
             c.sink.bodies().is_empty(),
             "the group key must not open a ratcheted broadcast"
+        );
+    }
+
+    /// Like `deliver`, but hands back what crossed the air so a test can assert
+    /// on the frames themselves. Draining without delivering would discard a
+    /// sender-key distribution and make the peer look broken.
+    fn deliver_and_capture(from: &Node, to: &Node) -> Vec<Vec<u8>> {
+        let wires = from.radio.drain();
+        for w in &wires {
+            to.core.ingest(-55, w).unwrap();
+        }
+        settle();
+        wires
+    }
+
+    fn last_broadcast_chain_id(wires: &[Vec<u8>]) -> Option<u32> {
+        wires
+            .iter()
+            .filter_map(|w| frame::parse(w).ok().and_then(|p| p.sk))
+            .map(|sk| sk.chain_id)
+            .next_back()
+    }
+
+    /// Post-compromise security for broadcasts. A stolen chain must stop being
+    /// useful, and the only thing that achieves that is replacing it with
+    /// randomness the attacker never saw — then getting the replacement out
+    /// without dropping a message or falling back to the group key on the way.
+    ///
+    /// Timings are chosen so exactly one rotation lands inside the test: the
+    /// introduction finishes around 600ms, the interval fires at 1200ms, and the
+    /// next would not be due until 2400ms — well after the last assertion.
+    #[test]
+    fn the_sender_chain_rotates_and_peers_keep_reading() {
+        let a = node_with("alice", 1, 1200);
+        let b = node("bob", 2);
+        a.core.start_broadcasting().unwrap();
+        b.core.start_broadcasting().unwrap();
+        settle();
+
+        // A leaner introduction than `introduce`, to leave room before the
+        // interval fires: B's beacon teaches A, A's reply carries the chain.
+        deliver(&b, &a);
+        deliver(&a, &b);
+        a.radio.drain();
+        b.radio.drain();
+
+        a.core.send_message(None, b"before rotation").unwrap();
+        settle();
+        let before = last_broadcast_chain_id(&deliver_and_capture(&a, &b))
+            .expect("the pre-rotation broadcast should be ratcheted");
+
+        // Cross the interval. The tick replaces the chain; the next delivery
+        // carries the fresh distribution to B.
+        std::thread::sleep(Duration::from_millis(500));
+        deliver_and_capture(&a, &b);
+
+        a.core.send_message(None, b"after rotation").unwrap();
+        settle();
+        let after = last_broadcast_chain_id(&deliver_and_capture(&a, &b))
+            .expect("the post-rotation broadcast should be ratcheted");
+
+        assert_ne!(before, after, "the chain must be replaced, not stepped");
+
+        let mut bodies = b.sink.bodies();
+        bodies.sort();
+        assert_eq!(
+            bodies,
+            vec![b"after rotation".to_vec(), b"before rotation".to_vec()],
+            "rotation must not cost the peer a message"
+        );
+        assert_eq!(
+            b.sink.fs_flags(),
+            vec![true; 2],
+            "rotation must never downgrade to the group key"
         );
     }
 

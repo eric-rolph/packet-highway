@@ -419,6 +419,28 @@ Three consequences worth stating plainly:
 - **A node with no peers still falls back** to the group key, with the flag
   clear — same honesty rule as the directed path.
 
+**Ratcheting is not recovery.** The ratchet shuts the past and nothing else:
+`ck_{i+1}` follows from `ck_i`, so an attacker who takes a chain key reads every
+broadcast that sender makes from then on — for the whole session, if the chain
+lives that long. Recovery needs entropy the attacker never saw, so the chain is
+**thrown away and regenerated** every `senderkey::ROTATE_INTERVAL_MS` and the
+fresh one is redistributed over the prekey path immediately. Replacement, not a
+step: a step would leave the new key derivable from the old.
+
+That interval is deliberately equal to `prekey::ROTATE_INTERVAL_MS` — the two
+jointly set the post-compromise window, so whichever is longer is the real bound
+and letting them drift would make one decorative
+(`chain_rotation_matches_prekey_rotation`). The cost is a burst of one directed
+frame per known peer per rotation, which is why `Config::chain_rotate_ms` exists:
+a deployment with many peers per node can trade window for traffic.
+
+The ordering inside `rotate_sender_chain` matters. `chain_shared_with` is cleared
+and refilled within one call, because while it is empty `seal` would fall back to
+the group key — a rotation that downgraded every broadcast in the gap would be
+worse than not rotating. The worker is single-threaded, so nothing can be sealed
+in between, and `the_sender_chain_rotates_and_peers_keep_reading` asserts both
+that the chain id changes and that no message is lost or downgraded across it.
+
 **Reordering, and a DoS the split-phase design closes.** BLE reorders, so a
 frame at index 9 arriving while we sit at index 6 must ratchet forward and keep
 the skipped message keys. That cache is the one place forward secrecy is
@@ -586,10 +608,10 @@ Two build choices worth stating:
 
 ## 8. Test coverage today
 
-103 tests, all runnable on a laptop with no device, all enforced by CI
+107 tests, all runnable on a laptop with no device, all enforced by CI
 (`.github/workflows/meshcore.yml`).
 
-- **83 Rust core + 6 FFI** (`cargo test`):
+- **87 Rust core + 6 FFI** (`cargo test`):
   - *crypto* — AEAD tamper and wrong-AAD rejection, Ed25519↔X25519 agreement in
     both directions, malformed peer ids refused at decode, **small-order peer
     ids refused at DH** (the vulnerability §5a describes), FS key agreement
@@ -602,7 +624,10 @@ Two build choices worth stating:
     a spent skip-cache key unusable twice, an index beyond `MAX_SKIP` refused,
     **deriving without committing leaving the chain untouched** (the forged-index
     DoS), the skip cache bounded, a replayed older distribution unable to rewind
-    a chain, a restarting peer not accumulating chains, unknown chains unopenable.
+    a chain, a restarting peer not accumulating chains, unknown chains unopenable,
+    a chain due only after its interval (and never after a backwards clock jump),
+    a rotated chain unreachable from the old one, chain rotation tied to prekey
+    rotation.
   - *prekey* — retention keeps in-flight mail decryptable, rotating past the
     depth destroys the secret, rotation respects its interval, retention
     outlives the outbox deadline, bundles round-trip, bundles attributed to the
@@ -627,7 +652,7 @@ Two build choices worth stating:
     secret once a peer holds the chain**, a broadcast before any distribution
     admits it is not, **a chain key is never broadcast**, a peer without the
     chain cannot read a ratcheted broadcast, reordered ratcheted broadcasts all
-    decode.
+    decode, **the sender chain rotates without losing a message or downgrading**.
   - *FFI* — full C-ABI lifecycle with a mock radio and sink, null-safety on every
     entry point, garbage-ingest fuzz over every prefix length, `MeshBuffer`
     non-copying roundtrip.
@@ -674,14 +699,14 @@ toolchain would make the two agree, at the cost of never seeing new lints.
 
 Honest inventory of what is *not* production-ready:
 
-1. **No post-compromise security.** There is no Double Ratchet, so an attacker
-   who steals the prekey ring reads directed traffic until the next rotation —
-   bounded at four minutes by §5a, not zero. A stolen sender chain is worse in
-   duration: it reads that peer's broadcasts until the peer restarts, because
-   nothing rotates the chain except session end. Rekeying the chain on the same
-   `ROTATE_INTERVAL_MS` as prekeys would bound it identically, at the cost of a
-   redistribution round to every peer; that is the next crypto step, and
-   `senderkey.rs` is shaped so it is a new `SenderChain` plus a re-send.
+1. **Post-compromise security is bounded, not achieved.** Both key schedules now
+   recover on a timer — a stolen prekey ring reads directed traffic for at most
+   four minutes, a stolen sender chain reads broadcasts for at most one rotation
+   interval. But recovery by *replacement on a clock* is weaker than recovery by
+   *DH per message*: there is still no Double Ratchet, so an attacker with
+   continuing access simply re-steals each new key and never loses the thread.
+   Closing that means a real ratchet on the directed path; `crypto.rs` is shaped
+   so the key-derivation swap stays local.
 2. **The skip cache trades a little forward secrecy for deliverability.**
    Up to `SKIPPED_CAP` message keys per chain are retained so out-of-order
    broadcasts still open. Each is erased when spent, but until then it is a live

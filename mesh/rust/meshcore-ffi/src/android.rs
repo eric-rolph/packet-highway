@@ -222,6 +222,10 @@ pub extern "system" fn Java_com_meshcore_MeshCoreNative_nativeCreate<'local>(
         identity_seed,
         ttl: if ttl <= 0 || ttl > 255 { 6 } else { ttl as u8 },
         epoch: None,
+        // Everything else takes the core's default. Struct-update syntax on
+        // purpose: a new tuning field in Config should not break the JNI
+        // surface, which only carries what Kotlin actually sets.
+        ..Default::default()
     };
 
     let radio = Arc::new(AndroidRadio {

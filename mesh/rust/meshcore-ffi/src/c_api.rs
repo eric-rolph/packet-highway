@@ -373,6 +373,10 @@ pub unsafe extern "C" fn mesh_core_new(
             // None => wall clock at construction. Pass a persisted boot counter
             // via MeshConfig once identity storage lands; see replay.rs.
             epoch: None,
+            // Everything else takes the core's default. Struct-update syntax on
+            // purpose: a new tuning field in Config should not break the C ABI,
+            // which only carries what MeshConfig actually exposes.
+            ..Default::default()
         };
 
         match MeshHandle::new_internal(core_cfg, Arc::new(CRadio(radio))) {
