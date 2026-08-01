@@ -1,0 +1,9 @@
+{
+  "//": "CI typecheck for the files that have no react-native dependency. src/index.ts and src/NativeMeshCore.ts import from 'react-native', which is a peer dependency the app supplies — checking them here would mean installing the whole RN package just to validate two import lines. events.ts is the file with real logic and a wire-format contract to keep, so it is the one that must stay strict.",
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "types": []
+  },
+  "include": [],
+  "files": ["src/events.ts"]
+}

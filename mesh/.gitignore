@@ -1,0 +1,18 @@
+# Rust
+rust/target/
+# cbindgen output — generated on every build, must never be stale in git
+rust/meshcore-ffi/include/
+
+# iOS build artifacts
+ios/Frameworks/
+ios/Pods/
+ios/build/
+
+# Android build artifacts
+android/build/
+android/.cxx/
+android/src/main/jniLibs/
+
+# JS
+js/node_modules/
+js/*.tsbuildinfo

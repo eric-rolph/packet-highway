@@ -1,0 +1,119 @@
+// mesh/android/build.gradle
+//
+// Produces the AAR containing:
+//   * jniLibs/<abi>/libmeshcore_ffi.so   — the Rust core (built by cargo-ndk)
+//   * jniLibs/<abi>/libmeshcore_jsi.so   — the C++ JSI layer (built by CMake)
+//   * the Kotlin Turbo Module + BLE radio
+//
+// The Rust build is wired in as a real Gradle task dependency rather than a
+// "run this script first" README line, so a stale .so cannot survive a
+// `./gradlew assembleRelease`.
+
+buildscript {
+  repositories { google(); mavenCentral() }
+  dependencies {
+    classpath "com.android.tools.build:gradle:8.5.0"
+    classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:1.9.24"
+  }
+}
+
+apply plugin: "com.android.library"
+apply plugin: "org.jetbrains.kotlin.android"
+
+def reactNativeArchitectures() {
+  def value = project.getProperties().get("reactNativeArchitectures")
+  return value ? value.split(",") : ["armeabi-v7a", "arm64-v8a", "x86", "x86_64"]
+}
+
+android {
+  namespace "com.meshcore"
+  compileSdk 34
+  ndkVersion "26.1.10909125"
+
+  defaultConfig {
+    minSdk 24          // BluetoothLeAdvertiser + AEAD without a compat shim
+    targetSdk 34
+
+    externalNativeBuild {
+      cmake {
+        // c++_shared is required: RN's own libraries use it, and two copies of
+        // the STL in one process is a real crash, not a theoretical one.
+        arguments "-DANDROID_STL=c++_shared",
+                  "-DREACT_NATIVE_DIR=${rootProject.file('../node_modules/react-native')}"
+        cppFlags "-std=c++17", "-frtti", "-fexceptions"
+        abiFilters(*reactNativeArchitectures())
+      }
+    }
+    consumerProguardFiles "consumer-rules.pro"
+  }
+
+  externalNativeBuild {
+    cmake {
+      path "CMakeLists.txt"
+      version "3.22.1"
+    }
+  }
+
+  sourceSets.main {
+    // cargo-ndk writes straight into the standard jniLibs layout.
+    jniLibs.srcDirs = ["src/main/jniLibs"]
+  }
+
+  packagingOptions {
+    // Both this AAR and the app may carry libc++_shared; keep the first.
+    pickFirst "**/libc++_shared.so"
+  }
+
+  buildFeatures { buildConfig true }
+
+  compileOptions {
+    sourceCompatibility JavaVersion.VERSION_17
+    targetCompatibility JavaVersion.VERSION_17
+  }
+  kotlinOptions { jvmTarget = "17" }
+}
+
+dependencies {
+  implementation "com.facebook.react:react-android"
+  implementation "org.jetbrains.kotlin:kotlin-stdlib:1.9.24"
+}
+
+// ---------------------------------------------------------------------------
+// Rust
+// ---------------------------------------------------------------------------
+
+def rustDir = file("${projectDir}/../rust")
+def rustProfile = { variantName -> variantName.toLowerCase().contains("release") ? "release" : "debug" }
+
+tasks.register("cargoBuildDebug", Exec) {
+  workingDir rustDir
+  commandLine "cargo", "ndk",
+      "-t", "armeabi-v7a", "-t", "arm64-v8a", "-t", "x86", "-t", "x86_64",
+      "-o", "${projectDir}/src/main/jniLibs",
+      "build", "-p", "meshcore-ffi"
+  // Rebuild only when Rust actually changed.
+  inputs.dir("${rustDir}/meshcore/src")
+  inputs.dir("${rustDir}/meshcore-ffi/src")
+  inputs.file("${rustDir}/Cargo.toml")
+  outputs.dir("${projectDir}/src/main/jniLibs")
+}
+
+tasks.register("cargoBuildRelease", Exec) {
+  workingDir rustDir
+  commandLine "cargo", "ndk",
+      "-t", "armeabi-v7a", "-t", "arm64-v8a", "-t", "x86", "-t", "x86_64",
+      "-o", "${projectDir}/src/main/jniLibs",
+      "build", "-p", "meshcore-ffi", "--release"
+  inputs.dir("${rustDir}/meshcore/src")
+  inputs.dir("${rustDir}/meshcore-ffi/src")
+  inputs.file("${rustDir}/Cargo.toml")
+  outputs.dir("${projectDir}/src/main/jniLibs")
+}
+
+// CMake needs the cbindgen-generated header, which only exists after a cargo
+// build — hence the ordering here rather than in a docs step.
+tasks.whenTaskAdded { task ->
+  if (task.name.startsWith("externalNativeBuild") || task.name.startsWith("configureCMake")) {
+    task.dependsOn(task.name.toLowerCase().contains("release") ? "cargoBuildRelease" : "cargoBuildDebug")
+  }
+}

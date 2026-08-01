@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = ["meshcore", "meshcore-ffi"]
+
+# One profile for every mobile artifact. Size matters on iOS (app thinning does
+# not strip a static lib's dead code as well as LTO does) and `panic = "abort"`
+# is deliberate: unwinding across the FFI boundary is undefined behaviour, so we
+# make a panic a hard crash *inside* Rust rather than a corrupted stack in ObjC.
+# Every extern fn still wraps its body in `catch_unwind` for the debug profile
+# where unwinding is enabled.
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77"
+license = "MIT"
+
+[workspace.dependencies]
+meshcore = { path = "meshcore" }

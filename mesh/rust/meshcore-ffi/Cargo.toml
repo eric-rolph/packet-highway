@@ -1,0 +1,24 @@
+[package]
+name = "meshcore-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "C ABI + JNI surface for meshcore. The only crate with #[no_mangle]."
+
+[lib]
+name = "meshcore_ffi"
+# staticlib -> libmeshcore_ffi.a, linked into the iOS XCFramework.
+# cdylib    -> libmeshcore_ffi.so, packed into the Android AAR by cargo-ndk.
+# rlib      -> lets `cargo test` link the FFI surface on the host.
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+meshcore = { workspace = true }
+# Compiled on every host, not just android. The JNI entry points are pure Rust
+# and type-check anywhere, so host CI catches signature drift instead of an
+# NDK build three hours later.
+jni = "0.21"
+
+[build-dependencies]
+cbindgen = "0.29"
