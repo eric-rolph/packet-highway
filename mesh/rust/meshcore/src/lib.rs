@@ -502,7 +502,10 @@ impl Worker {
             Some(peer) => {
                 // Directed: hold it until the recipient acks. This is the
                 // store-and-forward half — see outbox.rs.
-                if let Some(dropped) = self.outbox.push(msg_id, peer, wire, now_ms()) {
+                if let Some(dropped) =
+                    self.outbox
+                        .push(msg_id, peer, wire, outbox::Traffic::User, now_ms())
+                {
                     self.emit(Event::message_expired(
                         self.tick_seq(),
                         dropped,
@@ -765,14 +768,24 @@ impl Worker {
                 if let Some(dist) = senderkey::parse_distribution(&plaintext) {
                     self.chains.install(parsed.sender, &dist);
                 }
+                // Ack even if the body was malformed. The sender is retrying
+                // until it hears back, and a peer that keeps re-sending a frame
+                // we will never accept is worse than one that stops.
+                self.send_ack(&parsed.sender, parsed.msg_id)?;
             }
             FrameKind::Ack => {
                 if plaintext.len() == 16 {
                     let mut acked = [0u8; 16];
                     acked.copy_from_slice(&plaintext);
-                    if self.outbox.ack(&acked) {
-                        self.sync_outbox_len();
-                        self.emit(Event::message_delivered(self.tick_seq(), acked, true));
+                    match self.outbox.ack(&acked) {
+                        Some(outbox::Traffic::User) => {
+                            self.sync_outbox_len();
+                            self.emit(Event::message_delivered(self.tick_seq(), acked, true));
+                        }
+                        // A distribution landing is protocol housekeeping. The
+                        // user never sent it, so there is nothing to report.
+                        Some(outbox::Traffic::Internal) => self.sync_outbox_len(),
+                        None => {}
                     }
                 }
             }
@@ -811,16 +824,31 @@ impl Worker {
     ///
     /// We send the chain *as it stands*, so the peer reads from here on and
     /// nothing before — no retroactive access for someone who just walked in.
+    ///
+    /// Queued in the outbox rather than fired and forgotten. Losing this one
+    /// frame costs the peer every broadcast we make until the next
+    /// redistribution, which is exactly the failure the outbox exists to
+    /// prevent; it is tagged `Internal` so the retries stay invisible to the UI.
     fn send_sender_key(&mut self, to: &PeerId) -> Result<(), CoreError> {
         if !self.running.load(Ordering::Acquire) {
             return Ok(());
         }
+        let msg_id = crypto::random_16()?;
         let dist = self.sender_chain.distribution();
-        let wire = self.seal(*to, crypto::random_16()?, &dist, FrameKind::SenderKey)?;
+        let wire = self.seal(*to, msg_id, &dist, FrameKind::SenderKey)?;
         self.transmit(to, &wire);
-        // Recorded even if the frame is lost on the air: the retry is the next
-        // prekey rotation, and until then falling back to the group key for
-        // broadcasts would be a downgrade, not a repair.
+
+        // Any earlier distribution to this peer describes chain state we have
+        // moved past — retrying it would spend air re-announcing a position we
+        // no longer broadcast from.
+        self.outbox.drop_superseded_internal(to);
+        self.outbox
+            .push(msg_id, *to, wire, outbox::Traffic::Internal, now_ms());
+
+        // Marked shared optimistically, on send rather than on ack. Waiting for
+        // the ack would leave `chain_shared_with` empty for a round trip, and
+        // `seal` would spend that window emitting group-key broadcasts — a
+        // downgrade, which is worse than a peer briefly missing one message.
         self.chain_shared_with.insert(*to);
         Ok(())
     }
@@ -888,11 +916,16 @@ impl Worker {
                     self.transmit(&item.recipient, &wire);
                 }
                 outbox::Due::Expired => {
-                    self.emit(Event::message_expired(
-                        self.tick_seq(),
-                        item.msg_id,
-                        "no ack",
-                    ));
+                    // Only the user's own messages produce a receipt. A
+                    // distribution that timed out is reported to nobody — the
+                    // next prekey rotation queues a fresh one anyway.
+                    if item.traffic == outbox::Traffic::User {
+                        self.emit(Event::message_expired(
+                            self.tick_seq(),
+                            item.msg_id,
+                            "no ack",
+                        ));
+                    }
                 }
             }
         }
@@ -927,8 +960,11 @@ impl Worker {
     }
 
     fn sync_outbox_len(&self) {
+        // `user_len`, not `len`: a queued sender-key distribution is not a
+        // message the user is waiting on, and counting it would make the UI's
+        // pending badge tick up on its own.
         self.outbox_len
-            .store(self.outbox.len() as u64, Ordering::Relaxed);
+            .store(self.outbox.user_len() as u64, Ordering::Relaxed);
     }
 
     /// Returns `true` if we had already seen this id.
@@ -1530,6 +1566,85 @@ mod tests {
             c.sink.bodies().is_empty(),
             "the group key must not open a ratcheted broadcast"
         );
+    }
+
+    /// The failure this increment closes: the distribution is lost on the air.
+    /// Before the outbox carried it, B stayed unable to read A's broadcasts
+    /// until the next prekey rotation a minute later. Now the retry recovers it.
+    #[test]
+    fn a_dropped_sender_key_distribution_is_retried() {
+        let a = node("alice", 1);
+        let b = node("bob", 2);
+        a.core.start_broadcasting().unwrap();
+        b.core.start_broadcasting().unwrap();
+        settle();
+
+        // A hears B and queues a distribution...
+        deliver(&b, &a);
+        // ...which the radio then loses entirely.
+        let dropped: Vec<_> = a
+            .radio
+            .drain()
+            .into_iter()
+            .filter(|w| {
+                frame::parse(w)
+                    .map(|p| p.kind == FrameKind::SenderKey)
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert_eq!(dropped.len(), 1, "precondition: exactly one went out");
+
+        // B has nothing, so this broadcast is unreadable to it.
+        a.core.send_message(None, b"lost to bob").unwrap();
+        settle();
+        deliver(&a, &b);
+        assert!(
+            b.sink.bodies().is_empty(),
+            "precondition: B cannot read yet"
+        );
+
+        // Wait out one backoff. The outbox re-sends the distribution.
+        std::thread::sleep(Duration::from_millis(outbox::BASE_BACKOFF_MS + 400));
+        deliver(&a, &b);
+
+        a.core.send_message(None, b"bob can read this").unwrap();
+        settle();
+        deliver(&a, &b);
+
+        assert_eq!(
+            b.sink.bodies(),
+            vec![b"bob can read this".to_vec()],
+            "the retried distribution must restore readability"
+        );
+    }
+
+    /// Retrying protocol frames must not invent receipts for messages the user
+    /// never sent, nor inflate the count the UI shows.
+    #[test]
+    fn sender_key_retries_are_invisible_to_the_user() {
+        let a = node("alice", 1);
+        let b = node("bob", 2);
+        a.core.start_broadcasting().unwrap();
+        b.core.start_broadcasting().unwrap();
+        settle();
+
+        deliver(&b, &a); // A queues a distribution for B
+        assert_eq!(
+            a.core.outbox_len(),
+            0,
+            "housekeeping must not show as pending"
+        );
+
+        // Let it be acked, and confirm no delivery receipt surfaced.
+        deliver(&a, &b);
+        deliver(&b, &a);
+        assert_eq!(
+            a.sink.count(event::KIND_MESSAGE_DELIVERED),
+            0,
+            "a distribution ack is not a delivery receipt"
+        );
+        assert_eq!(a.sink.count(event::KIND_MESSAGE_EXPIRED), 0);
+        assert_eq!(a.core.outbox_len(), 0);
     }
 
     /// Like `deliver`, but hands back what crossed the air so a test can assert

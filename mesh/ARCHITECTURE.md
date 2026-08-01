@@ -520,6 +520,24 @@ window; there is a test pinning that (`retries_reuse_the_original_frame`).
 The queue is bounded at 256 with oldest-first eviction, so a peer that never
 returns cannot grow it without limit.
 
+**Sender-key distributions ride the same queue.** They are directed, they are
+acked, and losing one costs the peer *every* broadcast we make until the next
+redistribution — which is the exact failure this module exists to prevent. What
+they must not do is surface as receipts: there is no user-visible message for a
+`messageDelivered` to attach to, and a `messageExpired` for a frame the user
+never sent would be a lie. So entries carry a `Traffic` tag; retry, backoff, wake
+and eviction are identical for both kinds, only the reporting differs, and
+`outbox_len` reports `user_len()` so protocol housekeeping never ticks up the
+UI's pending badge.
+
+Queuing a fresh distribution first drops any still-pending one for that peer:
+the old frame describes chain state we have moved past, so retrying it spends air
+re-announcing a position we no longer broadcast from.
+
+`a_dropped_sender_key_distribution_is_retried` is the regression test, and it was
+checked against the unfixed code — removing the `push` makes it fail, which is
+the only way to know a test of this shape is testing anything.
+
 ### Walking back into range
 
 The backoff timer is the fallback, not the mechanism. When a peer is
@@ -608,10 +626,10 @@ Two build choices worth stating:
 
 ## 8. Test coverage today
 
-107 tests, all runnable on a laptop with no device, all enforced by CI
+113 tests, all runnable on a laptop with no device, all enforced by CI
 (`.github/workflows/meshcore.yml`).
 
-- **87 Rust core + 6 FFI** (`cargo test`):
+- **93 Rust core + 6 FFI** (`cargo test`):
   - *crypto* — AEAD tamper and wrong-AAD rejection, Ed25519↔X25519 agreement in
     both directions, malformed peer ids refused at decode, **small-order peer
     ids refused at DH** (the vulnerability §5a describes), FS key agreement
@@ -643,7 +661,10 @@ Two build choices worth stating:
     beyond-window rejection, a >64 jump that would be a shift overflow, restart
     resets, whole-session replay refused, `u64::MAX` saturation.
   - *outbox* — backoff growth and cap, ack removal, peer-discovery wake, bounded
-    eviction, retry byte-identity, re-queue consistency.
+    eviction, retry byte-identity, re-queue consistency, internal traffic
+    retrying while staying out of the user count, acks reporting which kind they
+    cleared, expiry carrying the kind so receipts can be suppressed, a newer
+    distribution dropping the superseded one.
   - *core* — two-node handshake, dedup, replay rejected with a fresh msg_id,
     directed ack clears the outbox, unacked retry, a relay carrying a frame it
     cannot read, own re-flood ignored, queue flush on peer discovery,
@@ -652,7 +673,9 @@ Two build choices worth stating:
     secret once a peer holds the chain**, a broadcast before any distribution
     admits it is not, **a chain key is never broadcast**, a peer without the
     chain cannot read a ratcheted broadcast, reordered ratcheted broadcasts all
-    decode, **the sender chain rotates without losing a message or downgrading**.
+    decode, **the sender chain rotates without losing a message or downgrading**,
+    **a dropped sender-key distribution is retried**, and those retries stay
+    invisible to the user.
   - *FFI* — full C-ABI lifecycle with a mock radio and sink, null-safety on every
     entry point, garbage-ingest fuzz over every prefix length, `MeshBuffer`
     non-copying roundtrip.
@@ -732,14 +755,12 @@ Honest inventory of what is *not* production-ready:
    bytes on purpose (re-sealing would burn replay counters), so a message queued
    before the recipient's beacon arrived stays non-FS through its retries. Only
    messages sent *after* the prekey is known get the upgrade.
-8. **A lost sender-key distribution costs a peer one rotation interval.** The
-   distribution is fire-and-forget rather than outboxed, and its retry is the
-   next prekey rotation — so a peer that misses it cannot read that sender's
-   broadcasts for up to `ROTATE_INTERVAL_MS`. Retrying sooner needs a signal we
-   do not have: a receiver cannot distinguish "no chain for this sender" from
-   "a broadcast not meant for me to decrypt" without asking, and an
-   ask-on-failure message is a request an attacker can forge to make nodes
-   chatter. Putting distributions through the outbox is the smaller fix.
+8. **A peer that is unreachable for the whole outbox deadline still loses the
+   chain.** Distributions are now retried like any directed frame (§5b), so a
+   dropped one recovers in about a second instead of a rotation interval. But
+   after 120s of failure the entry expires silently, and that peer reads nothing
+   from us until the next prekey rotation queues a fresh one. Bounded at
+   `ROTATE_INTERVAL_MS`, not eliminated.
 9. **iOS background operation** needs `UIBackgroundModes` = `bluetooth-central`
    + `bluetooth-peripheral`, and the service UUID moves to the overflow area
    where only other iOS devices can see it. **Android background** needs a
