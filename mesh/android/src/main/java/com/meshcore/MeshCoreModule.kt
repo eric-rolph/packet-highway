@@ -55,7 +55,11 @@ class MeshCoreModule(private val reactContext: ReactApplicationContext) :
      * can assert it against its own constant before installing.
      */
     @ReactMethod(isBlockingSynchronousMethod = true)
-    fun initializeCore(nickname: String, identitySeedBase64: String?): Int {
+    fun initializeCore(
+        nickname: String,
+        identitySeedBase64: String?,
+        channelSecretBase64: String?,
+    ): Int {
         if (handle != 0L) return MeshCoreNative.nativeAbiVersion()
 
         val seed = identitySeedBase64
@@ -63,8 +67,15 @@ class MeshCoreModule(private val reactContext: ReactApplicationContext) :
             ?.let { runCatching { Base64.decode(it, Base64.NO_WRAP) }.getOrNull() }
             ?.takeIf { it.size == 32 }   // wrong length: mint a new identity instead of truncating
 
+        // Null means the published open channel — the default is resolved in
+        // Rust so all three surfaces agree on what "no secret" means.
+        val channel = channelSecretBase64
+            ?.takeIf { it.isNotEmpty() }
+            ?.let { runCatching { Base64.decode(it, Base64.NO_WRAP) }.getOrNull() }
+            ?.takeIf { it.isNotEmpty() }
+
         val r = MeshRadio(reactContext)
-        val h = MeshCoreNative.nativeCreate(nickname, seed, DEFAULT_TTL, r)
+        val h = MeshCoreNative.nativeCreate(nickname, seed, channel, DEFAULT_TTL, r)
         if (h == 0L) {
             throw IllegalStateException("mesh_core_new failed: ${MeshCoreNative.nativeLastError()}")
         }

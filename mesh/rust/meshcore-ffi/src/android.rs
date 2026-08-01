@@ -181,6 +181,7 @@ pub extern "system" fn Java_com_meshcore_MeshCoreNative_nativeCreate<'local>(
     _class: JClass<'local>,
     nickname: JString<'local>,
     seed: JByteArray<'local>,
+    channel_secret: JByteArray<'local>,
     ttl: jint,
     radio: JObject<'local>,
 ) -> jlong {
@@ -217,9 +218,21 @@ pub extern "system" fn Java_com_meshcore_MeshCoreNative_nativeCreate<'local>(
         }
     };
 
+    // Null means "the published open channel" — the same default the C ABI and
+    // the Rust core use, resolved in one place rather than three.
+    let channel_secret = if channel_secret.is_null() {
+        meshcore::crypto::OPEN_CHANNEL.to_vec()
+    } else {
+        match env.convert_byte_array(&channel_secret) {
+            Ok(v) if !v.is_empty() => v,
+            _ => meshcore::crypto::OPEN_CHANNEL.to_vec(),
+        }
+    };
+
     let cfg = Config {
         nickname,
         identity_seed,
+        channel_secret,
         ttl: if ttl <= 0 || ttl > 255 { 6 } else { ttl as u8 },
         epoch: None,
         // Everything else takes the core's default. Struct-update syntax on

@@ -98,9 +98,16 @@ pub const SIGNATURE_LEN: usize = 64;
 /// Domain separator baked into every derived key. Change it and old builds can
 /// no longer talk to new ones — which is the point during protocol migrations.
 const KDF_DOMAIN: &[u8] = b"meshcore/v4/ed25519-x25519-chacha20poly1305";
-/// Placeholder channel secret for the public mesh. In production this is the
-/// per-channel secret the user joined with, not a constant.
-const CHANNEL_SECRET: &[u8] = b"meshcore/v4/public-channel";
+/// The channel every node falls into when the caller supplies nothing.
+///
+/// This is a *published* value, not a secret — it names the open mesh anyone can
+/// join, in the way an unencrypted SSID does. It is deliberately not called a
+/// secret any more: treating a constant compiled into every copy of the binary
+/// as a secret was the misleading part of the old design, not the constant.
+///
+/// A caller that wants a mesh only its members can read passes its own bytes as
+/// [`crate::Config::channel_secret`].
+pub const OPEN_CHANNEL: &[u8] = b"meshcore/v4/open-channel";
 /// Signed alongside a prekey so a signature can never be replayed as anything
 /// other than a prekey announcement.
 const PREKEY_DOMAIN: &[u8] = b"meshcore/v4/prekey";
@@ -296,18 +303,32 @@ pub fn open_key_fs(
     Ok(fs_key(&dh1, &dh2, sender, recipient, generation))
 }
 
-/// Group key for broadcast traffic.
+/// Group key for the channel, derived from whatever secret the caller joined
+/// with.
 ///
-/// Derived from a constant, so it is **not** forward secret and never can be:
-/// whoever learns the channel secret reads every broadcast ever recorded under
-/// it. It survives as the bootstrap key — beacons must be readable by a peer
-/// that holds nothing yet — and as the fallback for a node with no peers to
-/// distribute a sender key to. Everything else uses [`sender_chain_step`].
-pub fn network_key() -> [u8; 32] {
+/// Two roles, both of them bootstrap-shaped:
+///
+/// * **Beacons.** A peer that holds nothing yet has to be able to read one, or
+///   it can never obtain a prekey and never receive a sender chain.
+/// * **Broadcasts from a node with no peers**, which has nobody to hand a chain
+///   to. Everything else uses [`sender_chain_step`].
+///
+/// It is **not** forward secret and never can be: whoever learns the channel
+/// secret reads every beacon ever recorded under it, and the pre-chain
+/// broadcasts too. What changed is the blast radius — the secret is now the
+/// caller's, so learning one channel's key says nothing about another's, and
+/// compiling the binary no longer grants membership.
+///
+/// Callers should derive this **once** and keep it; it is a SHA-256 per call.
+pub fn network_key(channel_secret: &[u8]) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(KDF_DOMAIN);
     h.update(b"\x02broadcast");
-    h.update(CHANNEL_SECRET);
+    // Length-prefixed so two different secrets cannot collide by concatenation
+    // with the domain tag — belt and braces, since the tag is fixed-length, but
+    // this is the kind of thing that stops being true when someone adds a field.
+    h.update((channel_secret.len() as u64).to_le_bytes());
+    h.update(channel_secret);
     h.finalize().into()
 }
 
@@ -574,7 +595,7 @@ mod tests {
 
     #[test]
     fn aead_rejects_tampering() {
-        let k = network_key();
+        let k = network_key(OPEN_CHANNEL);
         let n = [7u8; NONCE_LEN];
         let mut ct = seal_aead(&k, &n, b"aad", b"secret").unwrap();
         assert_eq!(open_aead(&k, &n, b"aad", &ct).unwrap(), b"secret");

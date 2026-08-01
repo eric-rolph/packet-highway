@@ -51,6 +51,17 @@ export interface InitOptions {
   nickname: string;
   /** 32 bytes, base64. Persist it in the Keychain / Android Keystore. */
   identitySeedBase64?: string | null;
+  /**
+   * Base64 secret naming the mesh to join. Everything readable without a prior
+   * exchange — beacons, and broadcasts from a node that has not yet handed out
+   * a sender chain — is sealed under a key derived from it, so nodes that do
+   * not share it are invisible to each other.
+   *
+   * Omit it and you join the **open channel**: a published value, readable by
+   * anyone running this library. That is the right default for a demo and the
+   * wrong one for anything private.
+   */
+  channelSecretBase64?: string | null;
 }
 
 class Mesh {
@@ -74,6 +85,7 @@ class Mesh {
     const nativeAbi = NativeMeshCore.initializeCore(
       options.nickname,
       options.identitySeedBase64 ?? null,
+      options.channelSecretBase64 ?? null,
     );
     if (nativeAbi !== MESH_ABI_VERSION) {
       throw new Error(

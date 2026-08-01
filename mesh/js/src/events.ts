@@ -12,7 +12,7 @@
  */
 
 /** Must equal `meshcore::ABI_VERSION`. Asserted at install time. */
-export const MESH_ABI_VERSION = 3;
+export const MESH_ABI_VERSION = 4;
 
 const HEADER_LEN = 16;
 
