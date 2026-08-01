@@ -134,8 +134,11 @@ pub struct SkPreamble {
 /// How to derive the sealing key for an outgoing frame.
 pub enum Sealing<'a> {
     /// Beacons, and broadcasts from a node with no peers to distribute a chain
-    /// to: the group key every member holds. Not forward secret.
-    Network,
+    /// to: the channel key every member holds. Not forward secret. The key is
+    /// passed in rather than derived here so it is computed once per session
+    /// instead of once per frame — and so a node cannot accidentally seal to a
+    /// channel it did not join.
+    Network { key: &'a [u8; 32] },
     /// Directed, but we have never seen a prekey for the recipient. Works, but
     /// is not forward secret — the receiver is told so.
     Static,
@@ -156,7 +159,7 @@ pub enum Sealing<'a> {
 
 /// How to derive the opening key for an inbound frame.
 pub enum Opening<'a> {
-    Network,
+    Network { key: &'a [u8; 32] },
     Static,
     ForwardSecret { prekey_secret: &'a StaticSecret },
     SenderKey { key: &'a [u8; 32] },
@@ -359,7 +362,7 @@ pub fn build(identity: &Identity, out: &Outgoing<'_>) -> Result<Vec<u8>, CoreErr
     // so the writer below cannot set one without the other.
     let mut preamble: [u8; FS_PREAMBLE_LEN] = [0u8; FS_PREAMBLE_LEN];
     let (key, preamble_flag, preamble_len) = match &out.sealing {
-        Sealing::Network => (crypto::network_key(), 0, 0),
+        Sealing::Network { key } => (**key, 0, 0),
         Sealing::Static => (identity.derive_static_key(&out.recipient)?, 0, 0),
         Sealing::ForwardSecret { ephemeral, prekey } => {
             let key = crypto::seal_key_fs(
@@ -431,7 +434,7 @@ pub fn open(
     opening: Opening<'_>,
 ) -> Result<Vec<u8>, CoreError> {
     let key = match opening {
-        Opening::Network => crypto::network_key(),
+        Opening::Network { key } => *key,
         Opening::Static => identity.derive_static_key(&f.sender)?,
         Opening::ForwardSecret { prekey_secret } => {
             let fs = f.fs.as_ref().ok_or(CoreError::Crypto("no FS preamble"))?;
@@ -465,6 +468,14 @@ pub fn relay(buf: &[u8]) -> Result<Vec<u8>, FrameError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The default channel, so these tests exercise the same path a caller who
+    /// supplies no secret gets. `'static` so the helpers below can hand out
+    /// `Outgoing` values that outlive the call.
+    fn open_key() -> &'static [u8; 32] {
+        static K: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+        K.get_or_init(|| crypto::network_key(crypto::OPEN_CHANNEL))
+    }
     use crate::prekey::PrekeyRing;
 
     fn broadcast(body: &[u8]) -> Outgoing<'_> {
@@ -477,7 +488,7 @@ mod tests {
             body,
             nickname: "",
             kind: FrameKind::Message,
-            sealing: Sealing::Network,
+            sealing: Sealing::Network { key: open_key() },
         }
     }
 
@@ -505,7 +516,10 @@ mod tests {
         assert_eq!(parsed.epoch, 42);
         assert_eq!(parsed.counter, 7);
         assert!(!parsed.is_forward_secret());
-        assert_eq!(open(&b, &parsed, Opening::Network).unwrap(), b"hi");
+        assert_eq!(
+            open(&b, &parsed, Opening::Network { key: open_key() }).unwrap(),
+            b"hi"
+        );
     }
 
     #[test]
@@ -703,7 +717,7 @@ mod tests {
         );
 
         // The group key must not open it — that is the whole point.
-        assert!(open(&b, &p, Opening::Network).is_err());
+        assert!(open(&b, &p, Opening::Network { key: open_key() }).is_err());
         // Nor may a different message key from the same chain.
         assert!(open(&b, &p, Opening::SenderKey { key: &[0x5Bu8; 32] }).is_err());
     }
@@ -788,7 +802,10 @@ mod tests {
         assert_eq!(p.ttl, 2);
         assert_eq!(p.hops, 2);
         // TTL/hops changed but the AEAD still verifies: they are outside the AAD.
-        assert_eq!(open(&b, &p, Opening::Network).unwrap(), b"relayed");
+        assert_eq!(
+            open(&b, &p, Opening::Network { key: open_key() }).unwrap(),
+            b"relayed"
+        );
     }
 
     #[test]
@@ -801,7 +818,7 @@ mod tests {
             tampered[offset] ^= 0xff;
             let p = parse(&tampered).unwrap();
             assert!(
-                open(&b, &p, Opening::Network).is_err(),
+                open(&b, &p, Opening::Network { key: open_key() }).is_err(),
                 "flipping byte {offset} (epoch/counter) must fail AEAD"
             );
         }
@@ -822,7 +839,7 @@ mod tests {
             tampered[offset] ^= 0xff;
             let broke = match parse(&tampered) {
                 Err(_) => true, // structural rejection also counts
-                Ok(p) => open(&b, &p, Opening::Network).is_err(),
+                Ok(p) => open(&b, &p, Opening::Network { key: open_key() }).is_err(),
             };
             assert!(broke, "tampering with header byte {offset} went undetected");
         }
@@ -845,7 +862,7 @@ mod tests {
                 body: &bundle,
                 nickname: "alice-with-a-very-long-name",
                 kind: FrameKind::Beacon,
-                sealing: Sealing::Network,
+                sealing: Sealing::Network { key: open_key() },
             },
         )
         .unwrap();
@@ -854,7 +871,7 @@ mod tests {
         assert!(p.nickname.len() <= MAX_NICKNAME);
         assert!(p.nickname.starts_with("alice"));
 
-        let body = open(&b, &p, Opening::Network).unwrap();
+        let body = open(&b, &p, Opening::Network { key: open_key() }).unwrap();
         let peer_prekey = crate::prekey::parse_bundle(&a.public_id(), &body).unwrap();
         assert_eq!(peer_prekey.public, ring.current().public);
     }
@@ -874,7 +891,7 @@ mod tests {
                 body: b"",
                 nickname: &long,
                 kind: FrameKind::Beacon,
-                sealing: Sealing::Network,
+                sealing: Sealing::Network { key: open_key() },
             },
         )
         .unwrap();

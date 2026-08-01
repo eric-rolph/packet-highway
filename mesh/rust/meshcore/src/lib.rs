@@ -51,7 +51,7 @@ pub use senderkey::{ChainStore, SenderChain};
 /// Bumped whenever the C ABI or the binary event layout changes. The native
 /// layer asserts this at install time so a stale `.so` can never silently
 /// mis-decode events.
-pub const ABI_VERSION: u32 = 3;
+pub const ABI_VERSION: u32 = 4;
 
 /// Max hops a flooded frame may take before it is dropped.
 const DEFAULT_TTL: u8 = 6;
@@ -140,6 +140,19 @@ pub struct Config {
     /// wall clock at construction; pass a persisted boot counter if you have
     /// one (see `replay.rs` for why that is better).
     pub epoch: Option<u64>,
+    /// The secret that defines which mesh this node is part of.
+    ///
+    /// Everything readable without a prior exchange — beacons, and broadcasts
+    /// from a node that has not yet handed anyone a sender chain — is sealed
+    /// under a key derived from this. Nodes that do not share it are invisible
+    /// to each other: their frames fail authentication and are dropped as
+    /// noise, which is also what stops two unrelated meshes in the same room
+    /// from relaying for each other.
+    ///
+    /// Defaults to `crypto::OPEN_CHANNEL`, a published value naming the mesh
+    /// anyone can join. That default is *not* a secret and is not treated as
+    /// one; supply your own bytes to get a mesh only its members can read.
+    pub channel_secret: Vec<u8>,
     /// How long a broadcast sender chain lives before it is replaced and
     /// redistributed. This is the post-compromise exposure window for
     /// broadcasts, traded against one directed frame per peer per rotation —
@@ -154,6 +167,7 @@ impl Default for Config {
             identity_seed: None,
             ttl: DEFAULT_TTL,
             epoch: None,
+            channel_secret: crypto::OPEN_CHANNEL.to_vec(),
             chain_rotate_ms: senderkey::ROTATE_INTERVAL_MS,
         }
     }
@@ -248,6 +262,7 @@ impl MeshCore {
             outbox: Outbox::default(),
             outbox_len: outbox_len.clone(),
             carried_len: carried_len.clone(),
+            network_key: crypto::network_key(&config.channel_secret),
             prekeys: PrekeyRing::new(now_ms())?,
             peer_prekeys: HashMap::new(),
             sender_chain: SenderChain::new(now_ms())?,
@@ -407,6 +422,9 @@ struct Worker {
     prekeys: PrekeyRing,
     /// Prekeys advertised by peers, after signature verification.
     peer_prekeys: HashMap<PeerId, PeerPrekey>,
+    /// Key for this node's channel. Derived once at construction — it is a
+    /// SHA-256, and it is on the path of every beacon.
+    network_key: [u8; 32],
     /// Our broadcast chain, ratcheted once per broadcast.
     sender_chain: SenderChain,
     /// Peers' broadcast chains, as distributed to us.
@@ -492,7 +510,9 @@ impl Worker {
                 body: &bundle,
                 nickname: &nickname,
                 kind: FrameKind::Beacon,
-                sealing: frame::Sealing::Network,
+                sealing: frame::Sealing::Network {
+                    key: &self.network_key,
+                },
             },
         )?;
         self.radio.start_advertising(&wire)?;
@@ -575,7 +595,9 @@ impl Worker {
             body,
             nickname: "",
             kind,
-            sealing: frame::Sealing::Network,
+            sealing: frame::Sealing::Network {
+                key: &self.network_key,
+            },
         };
 
         if recipient == crypto::BROADCAST_ID {
@@ -685,7 +707,13 @@ impl Worker {
     fn unseal(&mut self, parsed: &ParsedFrame<'_>) -> Result<Vec<u8>, CoreError> {
         if parsed.is_broadcast() {
             let Some(sk) = parsed.sk else {
-                return frame::open(&self.identity, parsed, frame::Opening::Network);
+                return frame::open(
+                    &self.identity,
+                    parsed,
+                    frame::Opening::Network {
+                        key: &self.network_key,
+                    },
+                );
             };
             // Disjoint field borrows: `chains` mutably, `identity` shared.
             let chain = self
@@ -1226,6 +1254,7 @@ mod tests {
                 identity_seed: Some([seed; 32]),
                 ttl: 4,
                 epoch: Some(1),
+                channel_secret: crypto::OPEN_CHANNEL.to_vec(),
                 chain_rotate_ms,
             },
             radio.clone(),
@@ -1237,6 +1266,32 @@ mod tests {
 
     fn settle() {
         std::thread::sleep(Duration::from_millis(200));
+    }
+
+    /// A node on its own channel, to test that meshes actually separate.
+    fn node_on_channel(nickname: &str, seed: u8, channel: &[u8]) -> Node {
+        let radio = Arc::new(NullRadio::default());
+        let sink = Arc::new(CollectSink::default());
+        let core = MeshCore::new(
+            Config {
+                nickname: nickname.into(),
+                identity_seed: Some([seed; 32]),
+                ttl: 4,
+                epoch: Some(1),
+                channel_secret: channel.to_vec(),
+                chain_rotate_ms: senderkey::ROTATE_INTERVAL_MS,
+            },
+            radio.clone(),
+            sink.clone(),
+        )
+        .unwrap();
+        Node { core, radio, sink }
+    }
+
+    /// The default channel these test nodes all join.
+    fn open_key() -> &'static [u8; 32] {
+        static K: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+        K.get_or_init(|| crypto::network_key(crypto::OPEN_CHANNEL))
     }
 
     /// Hand everything `from` put on the air to `to`, as a radio would.
@@ -1284,7 +1339,7 @@ mod tests {
                 body: b"dup",
                 nickname: "",
                 kind: FrameKind::Message,
-                sealing: frame::Sealing::Network,
+                sealing: frame::Sealing::Network { key: open_key() },
             },
         )
         .unwrap();
@@ -1317,7 +1372,7 @@ mod tests {
                     body: b"transfer $100",
                     nickname: "",
                     kind: FrameKind::Message,
-                    sealing: frame::Sealing::Network,
+                    sealing: frame::Sealing::Network { key: open_key() },
                 },
             )
             .unwrap()
@@ -1508,6 +1563,55 @@ mod tests {
 
         assert_eq!(b.sink.bodies(), vec![b"no prekey yet".to_vec()]);
         assert_eq!(b.sink.fs_flags(), vec![false], "fallback must not claim FS");
+    }
+
+    /// The point of the channel secret: two meshes in the same room are
+    /// invisible to each other rather than merely uninteresting to each other.
+    #[test]
+    fn nodes_on_different_channels_cannot_see_each_other() {
+        let a = node_on_channel("alice", 1, b"channel-one");
+        let b = node_on_channel("bob", 2, b"channel-two");
+        a.core.start_broadcasting().unwrap();
+        b.core.start_broadcasting().unwrap();
+        settle();
+
+        // Beacons are the bootstrap, so if separation holds anywhere it must
+        // hold here: B must not even learn that A exists.
+        deliver(&a, &b);
+        deliver(&b, &a);
+        assert_eq!(
+            b.sink.count(event::KIND_PEER_DISCOVERED),
+            0,
+            "a foreign beacon must not produce a peer"
+        );
+        assert_eq!(a.sink.count(event::KIND_PEER_DISCOVERED), 0);
+
+        a.core.send_message(None, b"not for you").unwrap();
+        settle();
+        deliver(&a, &b);
+        assert!(
+            b.sink.bodies().is_empty(),
+            "a foreign broadcast must not decrypt"
+        );
+    }
+
+    /// The other half of the predicate: the same secret still forms one mesh.
+    /// Without this, a bug that made *every* channel unreadable would pass the
+    /// separation test above.
+    #[test]
+    fn nodes_sharing_a_channel_secret_form_one_mesh() {
+        let a = node_on_channel("alice", 1, b"shared-secret");
+        let b = node_on_channel("bob", 2, b"shared-secret");
+        a.core.start_broadcasting().unwrap();
+        b.core.start_broadcasting().unwrap();
+        settle();
+
+        a.core.send_message(None, b"hello channel").unwrap();
+        settle();
+        deliver(&a, &b);
+
+        assert_eq!(b.sink.bodies(), vec![b"hello channel".to_vec()]);
+        assert!(b.sink.count(event::KIND_PEER_DISCOVERED) >= 1);
     }
 
     /// A node with nobody to hand its chain to has only the group key, and must
@@ -1850,7 +1954,7 @@ mod tests {
                 body: &forged_bundle,
                 nickname: "victim",
                 kind: FrameKind::Beacon,
-                sealing: frame::Sealing::Network,
+                sealing: frame::Sealing::Network { key: open_key() },
             },
         )
         .unwrap();

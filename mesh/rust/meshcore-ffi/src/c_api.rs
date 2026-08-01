@@ -314,6 +314,11 @@ pub struct MeshConfig {
     pub nickname_len: usize,
     /// Exactly 32 bytes, or null to generate a fresh identity.
     pub identity_seed: *const u8,
+    /// Secret defining which mesh to join. Null falls back to the published
+    /// open channel — a mesh anyone can read, which is the right default for a
+    /// demo and the wrong one for anything private.
+    pub channel_secret: *const u8,
+    pub channel_secret_len: usize,
     pub ttl: u8,
 }
 
@@ -366,9 +371,15 @@ pub unsafe extern "C" fn mesh_core_new(
             seed
         });
 
+        // Borrowed for this call only; `Config` takes an owned copy.
+        let channel_secret = borrow(cfg.channel_secret, cfg.channel_secret_len)
+            .map(|b| b.to_vec())
+            .unwrap_or_else(|| meshcore::crypto::OPEN_CHANNEL.to_vec());
+
         let core_cfg = Config {
             nickname,
             identity_seed,
+            channel_secret,
             ttl: if cfg.ttl == 0 { 6 } else { cfg.ttl },
             // None => wall clock at construction. Pass a persisted boot counter
             // via MeshConfig once identity storage lands; see replay.rs.
@@ -675,6 +686,10 @@ mod tests {
             nickname: nick.as_ptr(),
             nickname_len: nick.len(),
             identity_seed: [7u8; 32].as_ptr(),
+            // Null exercises the open-channel default, which is what a caller
+            // that ignores the new field gets.
+            channel_secret: std::ptr::null(),
+            channel_secret_len: 0,
             ttl: 4,
         };
         let mut handle: *mut MeshHandle = std::ptr::null_mut();
@@ -771,6 +786,8 @@ mod tests {
             nickname: std::ptr::null(),
             nickname_len: 0,
             identity_seed: std::ptr::null(),
+            channel_secret: std::ptr::null(),
+            channel_secret_len: 0,
             ttl: 0,
         };
         let mut handle: *mut MeshHandle = std::ptr::null_mut();

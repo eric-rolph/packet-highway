@@ -25,7 +25,10 @@ bash scripts/build-android.sh                    # -> android/src/main/jniLibs/<
 ```ts
 import { mesh, peerIdToHex } from 'react-native-meshcore';
 
-mesh.initialize({ nickname: 'ada' });
+// Omit channelSecretBase64 and you join the *open* channel — a published
+// value anyone running this library can read. Supply one to get a mesh only
+// its members can see.
+mesh.initialize({ nickname: 'ada', channelSecretBase64: myChannelSecret });
 
 mesh.on('peerDiscovered', (e) => console.log('saw', e.nickname, e.rssi));
 mesh.on('messageReceived', (e) =>
@@ -56,8 +59,8 @@ js/       thin API + binary event decoder
 shared/cpp/   one JSI HostObject, compiled by BOTH platforms
   ↕ C ABI (cbindgen-generated header)
 rust/meshcore-ffi/   the only crate with #[no_mangle]
-rust/meshcore/       pure Rust: framing, Ed25519 identity, X3DH forward secrecy
-                     for directed mail + ratcheting sender keys for broadcasts,
+rust/meshcore/       pure Rust: channels, framing, Ed25519 identity, X3DH FS
+                     for directed mail, ratcheting sender keys for broadcasts,
                      ChaCha20-Poly1305, flood routing, anti-replay window,
                      store-and-forward outbox
   ↕ PlatformRadio trait (injected)

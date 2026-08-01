@@ -28,6 +28,8 @@ internal object MeshCoreNative {
     external fun nativeCreate(
         nickname: String,
         identitySeed: ByteArray?,
+        /** Null selects the published open channel. */
+        channelSecret: ByteArray?,
         ttl: Int,
         radio: MeshRadio,
     ): Long

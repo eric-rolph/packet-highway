@@ -584,6 +584,38 @@ retry loop. `a_peer_walking_into_range_flushes_the_queue_immediately` covers it.
 
 ---
 
+## 5c. Channels
+
+Everything readable without a prior exchange — beacons, and broadcasts from a
+node that has not yet handed anyone a sender chain — is sealed under
+`crypto::network_key(channel_secret)`. That was previously a constant compiled
+into every copy of the binary, which made "the network key" mean "anyone with
+this build".
+
+The secret is now supplied by the caller and threaded through all three
+surfaces: `Config::channel_secret` in Rust, `MeshConfig.channel_secret` in the C
+ABI, `channelSecretBase64` in the Turbo Module and JS. Omitting it joins
+`crypto::OPEN_CHANNEL` — deliberately renamed from `CHANNEL_SECRET`, because a
+published value that names the open mesh is not a secret and calling it one was
+the misleading part of the old design.
+
+Nodes that do not share a channel are **invisible** to each other rather than
+merely uninteresting: a foreign beacon fails authentication, so it never reaches
+the peer table and no prekey is ever installed. Both directions are pinned —
+`nodes_on_different_channels_cannot_see_each_other` and
+`nodes_sharing_a_channel_secret_form_one_mesh` — because a bug that made *every*
+channel unreadable would satisfy the first test alone.
+
+The key is derived once per session rather than per frame; it is a SHA-256 on
+the path of every beacon. `Sealing::Network`/`Opening::Network` carry it
+explicitly so a node cannot seal to a channel it did not join.
+
+Adding a field to `MeshConfig` is a C ABI change, so `ABI_VERSION` goes to 4 and
+the JS constant with it. That is what the version exists for: a stale `.so` now
+fails loudly at install instead of misreading the struct.
+
+---
+
 ## 6. Wire formats
 
 Both are little-endian (both mobile targets are LE). The **event** layout is
@@ -663,10 +695,10 @@ Two build choices worth stating:
 
 ## 8. Test coverage today
 
-121 tests, all runnable on a laptop with no device, all enforced by CI
+123 tests, all runnable on a laptop with no device, all enforced by CI
 (`.github/workflows/meshcore.yml`).
 
-- **101 Rust core + 6 FFI** (`cargo test`):
+- **103 Rust core + 6 FFI** (`cargo test`):
   - *crypto* — AEAD tamper and wrong-AAD rejection, Ed25519↔X25519 agreement in
     both directions, malformed peer ids refused at decode, **small-order peer
     ids refused at DH** (the vulnerability §5a describes), FS key agreement
@@ -713,7 +745,8 @@ Two build choices worth stating:
     decode, **the sender chain rotates without losing a message or downgrading**,
     **a dropped sender-key distribution is retried**, those retries stay
     invisible to the user, and **a relay carries a frame to a peer that only
-    arrives later**.
+    arrives later**, **nodes on different channels cannot see each other** and
+    nodes sharing one form a single mesh.
   - *relaycache* — carried frames returned on discovery, hand-off destructive so
     each relay forwards once, the same frame held only once however many
     neighbours flood it, bounded with oldest-first eviction, stale frames
@@ -777,12 +810,14 @@ Honest inventory of what is *not* production-ready:
    broadcasts still open. Each is erased when spent, but until then it is a live
    key. Shrinking the cap tightens the window and drops more reordered traffic;
    there is no setting that gives both.
-3. **The channel secret is a constant.** `CHANNEL_SECRET` in `crypto.rs` is a
-   placeholder for the per-channel secret a user actually joins with. Until it
-   is real, "the network key" means "anyone with this build". Sender keys shrink
-   the blast radius — the group key now only opens beacons and the broadcasts of
-   a node that has no peers yet — but membership is still unauthenticated, so
-   anyone with the build joins the mesh and receives chains like anyone else.
+3. **Channel membership is a shared secret, not an identity check.**
+   `Config::channel_secret` now selects the mesh, so compiling the binary no
+   longer grants membership and two meshes in the same room are invisible to
+   each other. But it is one symmetric secret held by everyone: any member can
+   hand it to anyone, nobody can be removed without re-keying the whole channel,
+   and there is no record of who joined. Real membership needs per-member
+   credentials — an admin-signed roster, or a group-key agreement — which is a
+   substantially larger design than a KDF input.
 4. **Epoch depends on the wall clock.** See §5b: a device whose clock rolls
    backwards has its frames refused by peers until it restarts. The fix is a
    persisted boot counter; `Config::epoch` already accepts one.

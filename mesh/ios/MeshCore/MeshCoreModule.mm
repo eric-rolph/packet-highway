@@ -61,11 +61,14 @@ RCT_EXPORT_MODULE(MeshCore)
 /// Create the Rust core.
 ///
 /// `identitySeedBase64` is the 32-byte seed you persisted in the Keychain, or
-/// nil to mint a new identity. Returns the ABI version so JS can assert it
-/// matches the version the JS package was built against.
+/// nil to mint a new identity. `channelSecretBase64` selects which mesh to
+/// join; nil means the published open channel that anyone can read. Returns the
+/// ABI version so JS can assert it matches the version the JS package was
+/// built against.
 RCT_EXPORT_BLOCKING_SYNCHRONOUS_METHOD(initializeCore
                                        : (NSString *)nickname
-                                       : (NSString *_Nullable)identitySeedBase64) {
+                                       : (NSString *_Nullable)identitySeedBase64
+                                       : (NSString *_Nullable)channelSecretBase64) {
   if (_core != NULL) {
     return @(mesh_abi_version());  // already initialised; idempotent
   }
@@ -80,14 +83,20 @@ RCT_EXPORT_BLOCKING_SYNCHRONOUS_METHOD(initializeCore
     seed = nil;  // wrong length is a caller bug; generating is safer than truncating
   }
 
+  NSData *channel = channelSecretBase64.length > 0
+                        ? [[NSData alloc] initWithBase64EncodedString:channelSecretBase64 options:0]
+                        : nil;
+
   MeshConfig cfg;
   cfg.nickname = (const uint8_t *)nick.bytes;
   cfg.nickname_len = nick.length;
   cfg.identity_seed = seed != nil ? (const uint8_t *)seed.bytes : NULL;
+  cfg.channel_secret = channel != nil ? (const uint8_t *)channel.bytes : NULL;
+  cfg.channel_secret_len = channel != nil ? channel.length : 0;
   cfg.ttl = 6;
 
-  // `nick`/`seed` are only borrowed for this call — Rust copies before it
-  // returns, so ARC releasing them right after is fine.
+  // `nick`/`seed`/`channel` are only borrowed for this call — Rust copies
+  // before it returns, so ARC releasing them right after is fine.
   MeshPlatformRadio vtable = [MeshRadio vtableForRadio:_radio];
 
   MeshHandle *handle = NULL;
