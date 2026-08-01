@@ -35,6 +35,7 @@ pub mod event;
 pub mod frame;
 pub mod outbox;
 pub mod prekey;
+pub mod relaycache;
 pub mod replay;
 pub mod senderkey;
 
@@ -43,6 +44,7 @@ pub use event::{Event, EventKind};
 pub use frame::{FrameError, FrameKind, ParsedFrame};
 pub use outbox::Outbox;
 pub use prekey::{PeerPrekey, PrekeyRing};
+pub use relaycache::RelayCache;
 pub use replay::{ReplayVerdict, ReplayWindow};
 pub use senderkey::{ChainStore, SenderChain};
 
@@ -207,6 +209,8 @@ pub struct MeshCore {
     inbox: Arc<Mutex<VecDeque<Event>>>,
     /// Depth of the retransmit queue, readable without touching the worker.
     outbox_len: Arc<AtomicU64>,
+    /// How many frames we are carrying for absent peers, same access pattern.
+    carried_len: Arc<AtomicU64>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -228,6 +232,7 @@ impl MeshCore {
         let peers: Arc<Mutex<HashMap<PeerId, Peer>>> = Arc::new(Mutex::new(HashMap::new()));
         let inbox = Arc::new(Mutex::new(VecDeque::new()));
         let outbox_len = Arc::new(AtomicU64::new(0));
+        let carried_len = Arc::new(AtomicU64::new(0));
 
         let mut worker_state = Worker {
             config: config.clone(),
@@ -242,11 +247,13 @@ impl MeshCore {
             inbox: inbox.clone(),
             outbox: Outbox::default(),
             outbox_len: outbox_len.clone(),
+            carried_len: carried_len.clone(),
             prekeys: PrekeyRing::new(now_ms())?,
             peer_prekeys: HashMap::new(),
             sender_chain: SenderChain::new(now_ms())?,
             chains: ChainStore::default(),
             chain_shared_with: HashSet::new(),
+            relay_cache: RelayCache::default(),
             replay: HashMap::new(),
             seen: VecDeque::with_capacity(DEDUP_CAPACITY),
             seen_set: HashMap::new(),
@@ -270,6 +277,7 @@ impl MeshCore {
             peers,
             inbox,
             outbox_len,
+            carried_len,
             worker: Some(worker),
         })
     }
@@ -285,6 +293,13 @@ impl MeshCore {
     /// Number of directed messages awaiting an ack.
     pub fn outbox_len(&self) -> u64 {
         self.outbox_len.load(Ordering::Relaxed)
+    }
+
+    /// Number of frames we are holding on behalf of peers we cannot currently
+    /// see — mail this node is carrying for the mesh rather than for itself.
+    /// Not yet surfaced through the C ABI; see `relaycache.rs`.
+    pub fn carried_len(&self) -> u64 {
+        self.carried_len.load(Ordering::Relaxed)
     }
 
     pub fn start_broadcasting(&self) -> Result<(), CoreError> {
@@ -387,6 +402,7 @@ struct Worker {
     inbox: Arc<Mutex<VecDeque<Event>>>,
     outbox: Outbox,
     outbox_len: Arc<AtomicU64>,
+    carried_len: Arc<AtomicU64>,
     /// Our own rotating prekeys — the forward-secrecy ring.
     prekeys: PrekeyRing,
     /// Prekeys advertised by peers, after signature verification.
@@ -398,6 +414,8 @@ struct Worker {
     /// Peers we have handed our current chain to. Empty means nobody could read
     /// a ratcheted broadcast yet, so we fall back to the group key.
     chain_shared_with: HashSet<PeerId>,
+    /// Directed frames we are carrying for peers we cannot currently see.
+    relay_cache: RelayCache,
     replay: HashMap<PeerId, ReplayWindow>,
     seen: VecDeque<[u8; 16]>,
     seen_set: HashMap<[u8; 16], u64>,
@@ -645,6 +663,16 @@ impl Worker {
         if parsed.ttl > 1 && parsed.recipient != self.identity.public_id() {
             let relayed = frame::relay(bytes)?;
             let _ = self.radio.start_advertising(&relayed);
+
+            // 4. Carry it. Re-flooding once only helps if someone in range can
+            //    reach the recipient *now*; holding it means the message can
+            //    travel with us instead. Only for a peer we cannot see — one
+            //    already in the table just received the flood above.
+            if !parsed.is_broadcast() && !self.knows_peer(&parsed.recipient) {
+                self.relay_cache
+                    .store(parsed.recipient, parsed.msg_id, relayed, now_ms());
+                self.sync_carried_len();
+            }
         }
         Ok(())
     }
@@ -909,6 +937,12 @@ impl Worker {
             return;
         }
 
+        // Stop carrying mail the sender has already given up on — delivering it
+        // would contradict a `messageExpired` the user has already been shown.
+        if self.relay_cache.expire(now) > 0 {
+            self.sync_carried_len();
+        }
+
         // Retransmit and expire.
         for item in self.outbox.take_due(now) {
             match item.due {
@@ -957,6 +991,20 @@ impl Worker {
                 self.emit(Event::error(self.tick_seq(), &e.to_string()));
             }
         }
+    }
+
+    /// Whether this peer is currently in our table — i.e. reachable right now,
+    /// so a frame we just flooded stood a chance of landing.
+    fn knows_peer(&self, peer: &PeerId) -> bool {
+        self.peers
+            .lock()
+            .map(|p| p.contains_key(peer))
+            .unwrap_or(false)
+    }
+
+    fn sync_carried_len(&self) {
+        self.carried_len
+            .store(self.relay_cache.len() as u64, Ordering::Relaxed);
     }
 
     fn sync_outbox_len(&self) {
@@ -1016,6 +1064,14 @@ impl Worker {
             if self.outbox.wake_for_peer(&id, now_ms()) > 0 {
                 self.flush_woken(&id);
             }
+            // And anything we were carrying *for* them on someone else's behalf.
+            // This is the delivery that could not have happened otherwise: the
+            // sender may be long out of range, and we are the only node that
+            // still has the frame.
+            for wire in self.relay_cache.take_for_peer(&id) {
+                let _ = self.radio.start_advertising(&wire);
+            }
+            self.sync_carried_len();
         }
     }
 
@@ -1847,6 +1903,103 @@ mod tests {
         // ...but it re-floods it, and C can.
         deliver(&relay, &c);
         assert_eq!(c.sink.bodies(), vec![b"two hops".to_vec()]);
+    }
+
+    /// The delivery that could not happen before: the sender and the recipient
+    /// are never in range at the same time, and the message crosses anyway
+    /// because a relay carried it.
+    #[test]
+    fn a_relay_carries_a_frame_to_a_peer_that_arrives_later() {
+        let a = node("alice", 1);
+        let relay = node("relay", 2);
+        let c = node("carol", 3);
+        for n in [&a, &relay, &c] {
+            n.core.start_broadcasting().unwrap();
+        }
+        settle();
+
+        // Carol is nowhere to be seen. Alice sends to her; only the relay hears.
+        a.core
+            .send_message(Some(c.core.public_key()), b"carried mail")
+            .unwrap();
+        settle();
+        deliver(&a, &relay);
+        assert!(
+            relay.sink.bodies().is_empty(),
+            "the relay must not be able to read what it carries"
+        );
+
+        // Alice now leaves entirely — nothing more of hers reaches anyone.
+        a.radio.drain();
+        relay.radio.drain();
+
+        // Carol walks into range of the relay. Her beacon is the trigger.
+        deliver(&c, &relay);
+        deliver(&relay, &c);
+
+        assert_eq!(
+            c.sink.bodies(),
+            vec![b"carried mail".to_vec()],
+            "the relay should have handed over the frame it was holding"
+        );
+    }
+
+    /// Carrying is for peers we cannot reach. A frame for someone already in
+    /// the table was just flooded to them; holding a copy would crowd out mail
+    /// that actually needs carrying.
+    #[test]
+    fn a_frame_for_a_visible_peer_is_not_carried() {
+        let a = node("alice", 1);
+        let relay = node("relay", 2);
+        let c = node("carol", 3);
+        for n in [&a, &relay, &c] {
+            n.core.start_broadcasting().unwrap();
+        }
+        settle();
+
+        // The relay can see Carol before the message arrives.
+        deliver(&c, &relay);
+        relay.radio.drain();
+
+        a.core
+            .send_message(Some(c.core.public_key()), b"she is right there")
+            .unwrap();
+        settle();
+        deliver(&a, &relay);
+
+        // Re-flooded once and reaching her, without being held.
+        deliver(&relay, &c);
+        assert_eq!(c.sink.bodies(), vec![b"she is right there".to_vec()]);
+        assert_eq!(
+            relay.core.carried_len(),
+            0,
+            "a visible peer's mail must not occupy the carry buffer"
+        );
+    }
+
+    /// The counterpart, so the two together pin the predicate rather than just
+    /// its happy path: an unreachable recipient *is* carried.
+    #[test]
+    fn a_frame_for_an_unseen_peer_is_carried() {
+        let a = node("alice", 1);
+        let relay = node("relay", 2);
+        let c = node("carol", 3);
+        a.core.start_broadcasting().unwrap();
+        relay.core.start_broadcasting().unwrap();
+        settle();
+
+        // Carol never beacons, so the relay has never seen her.
+        a.core
+            .send_message(Some(c.core.public_key()), b"hold this")
+            .unwrap();
+        settle();
+        deliver(&a, &relay);
+
+        assert_eq!(
+            relay.core.carried_len(),
+            1,
+            "an unreachable recipient's mail must be carried"
+        );
     }
 
     #[test]

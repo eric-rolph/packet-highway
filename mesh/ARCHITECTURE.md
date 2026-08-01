@@ -118,6 +118,7 @@ mesh/
 │   │   ├── src/senderkey.rs           ratcheting sender keys (broadcast FS)
 │   │   ├── src/frame.rs               wire format v4, build/open/relay
 │   │   ├── src/replay.rs              per-sender sliding anti-replay window
+│   │   ├── src/relaycache.rs          carrying mail for peers out of range
 │   │   ├── src/outbox.rs              store-and-forward: acks, backoff, expiry
 │   │   ├── src/event.rs               events + the binary layout JS decodes
 │   │   └── examples/dump_event_fixtures.rs   feeds the JS contract test
@@ -538,6 +539,42 @@ re-announcing a position we no longer broadcast from.
 checked against the unfixed code — removing the `push` makes it fail, which is
 the only way to know a test of this shape is testing anything.
 
+### Carrying someone else's mail (`relaycache.rs`)
+
+The outbox covers a node's *own* undelivered messages. The other half — what
+makes a mesh delay-tolerant rather than merely multi-hop — is carrying frames for
+peers nobody can currently reach. Previously a directed frame for an absent
+recipient was re-flooded once and forgotten, so if no node in range could reach
+them at that instant the message was simply gone, even though a node that heard
+it might meet the recipient a minute later.
+
+Relays now hold such frames and hand them over on discovery. The relay cannot
+read any of it — this is ciphertext it has no key for, held only because the
+32-byte recipient id is in the clear in the header.
+
+Three things are deliberately *not* carried: broadcasts (already repeated by
+every node that hears them), frames addressed to us (ours to handle), and frames
+for a peer already in our table (just flooded to someone who is right there —
+caching those crowds out the mail that actually needs carrying). The last
+predicate is pinned from both sides, by `a_frame_for_a_visible_peer_is_not_carried`
+and `a_frame_for_an_unseen_peer_is_carried`; the first version of that test
+passed with the guard removed, which is why both exist.
+
+Hand-off is destructive. In a crowded room every relay that saw a frame holds a
+copy, so a peer walking back into range would otherwise draw one flood per relay.
+The recipient's dedup would swallow the duplicates, but the air time is already
+spent by then.
+
+Two bounds, and the second is a correctness property rather than housekeeping:
+`CAPACITY` stops a hostile flooder from turning every relay into its memory, and
+`TTL_MS` stops a relay delivering a message the *sender* has already reported
+expired to its user. The two constants are tuned independently — a deployment may
+want relays to give up sooner — but a `const` assertion makes tuning them the
+wrong way round a build failure, which was verified by doing it.
+
+`MeshCore::carried_len()` exposes how much mail a node is holding for the mesh.
+Not yet plumbed through the C ABI.
+
 ### Walking back into range
 
 The backoff timer is the fallback, not the mechanism. When a peer is
@@ -626,10 +663,10 @@ Two build choices worth stating:
 
 ## 8. Test coverage today
 
-113 tests, all runnable on a laptop with no device, all enforced by CI
+121 tests, all runnable on a laptop with no device, all enforced by CI
 (`.github/workflows/meshcore.yml`).
 
-- **93 Rust core + 6 FFI** (`cargo test`):
+- **101 Rust core + 6 FFI** (`cargo test`):
   - *crypto* — AEAD tamper and wrong-AAD rejection, Ed25519↔X25519 agreement in
     both directions, malformed peer ids refused at decode, **small-order peer
     ids refused at DH** (the vulnerability §5a describes), FS key agreement
@@ -674,8 +711,13 @@ Two build choices worth stating:
     admits it is not, **a chain key is never broadcast**, a peer without the
     chain cannot read a ratcheted broadcast, reordered ratcheted broadcasts all
     decode, **the sender chain rotates without losing a message or downgrading**,
-    **a dropped sender-key distribution is retried**, and those retries stay
-    invisible to the user.
+    **a dropped sender-key distribution is retried**, those retries stay
+    invisible to the user, and **a relay carries a frame to a peer that only
+    arrives later**.
+  - *relaycache* — carried frames returned on discovery, hand-off destructive so
+    each relay forwards once, the same frame held only once however many
+    neighbours flood it, bounded with oldest-first eviction, stale frames
+    dropped.
   - *FFI* — full C-ABI lifecycle with a mock radio and sink, null-safety on every
     entry point, garbage-ingest fuzz over every prefix length, `MeshBuffer`
     non-copying roundtrip.
@@ -766,9 +808,10 @@ Honest inventory of what is *not* production-ready:
    where only other iOS devices can see it. **Android background** needs a
    foreground service, or the scanner is throttled to ~1 result per 5 minutes
    with the screen off.
-10. **Relay-side store-and-forward is not implemented.** A node retries its *own*
-   undelivered messages (§5b), but does not cache and later re-flood frames it
-   merely relayed for a peer that was out of range.
+10. **Carried mail is bounded and best-effort.** Relays now hold frames for
+   absent peers (§5b), but a relay that fills its 128-frame buffer, restarts, or
+   never meets the recipient still drops them, and nothing tells the sender that
+   happened. It raises the odds of delivery; it does not make delivery reliable.
 11. **The native layers are unverified by CI.** The Objective-C++ and
     Kotlin/CMake code compiles only under Xcode and the Android NDK, neither of
     which is on the CI runner. `cargo check` covers the mobile *Rust* targets;
