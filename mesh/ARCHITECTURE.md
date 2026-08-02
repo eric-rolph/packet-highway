@@ -116,7 +116,7 @@ mesh/
 │   │   ├── src/crypto.rs              Ed25519 identity, X25519 DH, ChaCha20-Poly1305
 │   │   ├── src/prekey.rs              rotating signed prekeys (directed FS)
 │   │   ├── src/senderkey.rs           ratcheting sender keys (broadcast FS)
-│   │   ├── src/frame.rs               wire format v4, build/open/relay
+│   │   ├── src/frame.rs               wire format v5, build/open/relay
 │   │   ├── src/replay.rs              per-sender sliding anti-replay window
 │   │   ├── src/relaycache.rs          carrying mail for peers out of range
 │   │   ├── src/outbox.rs              store-and-forward: acks, backoff, expiry
@@ -626,7 +626,7 @@ independent `VERSION` byte, because the two evolve for different reasons: adding
 sender keys changed what goes on the air without moving a single event field, so
 the frame went to v4 and the ABI stayed at 3.
 
-**Frame v4** (116-byte header + at most one preamble + nickname + ciphertext):
+**Frame v5** (116-byte header + at most one preamble + nickname + ciphertext):
 
 ```
 0   magic 'M' │ 1  version │ 2  flags* │ 3  ttl† │ 4  hops† │ 5  nick_len
@@ -639,9 +639,29 @@ the frame went to v4 and the ABI stayed at 3.
 
 `ttl`/`hops` (†) are the only fields outside the AAD — a relay must decrement
 TTL without holding a key. Everything else is authenticated, including `epoch`,
-`counter`, the flags (*) and whichever preamble is present, so an attacker can
-neither replay, downgrade off a forward-secret path, re-point a frame at a
-different prekey, nor steer a receiver to a different point in a sender chain.
+`counter`, the flags (*), whichever preamble is present, **and the nickname**,
+so an attacker can neither replay, downgrade off a forward-secret path, re-point
+a frame at a different prekey, steer a receiver to a different point in a sender
+chain, nor rewrite the display name a verified peer appears under.
+
+That last one was not true until v5. The nickname was appended *after* the AAD
+snapshot, so anyone in radio range could capture a beacon, overwrite the name
+bytes (the length is in the authenticated header, so a same-length substitution
+passes), and re-transmit — and the AEAD still verified. The UI would then show
+an attacker-chosen name against a cryptographically verified Ed25519 identity.
+An audit found it; `the_nickname_is_authenticated` is the regression test. The
+nickname is authenticated but deliberately **not** confidential: a relay holds
+no key and must forward the frame byte-for-byte.
+
+A frame is also now rejected when its preamble disagrees with its recipient — an
+FS preamble on a broadcast, or a sender-key preamble on a directed frame. Each
+names a key agreement that cannot exist for that recipient, and `unseal` chooses
+the opening key from the recipient while `is_forward_secret()` looked only at
+the preambles. The two disagreed, so a broadcast sealed under the channel key
+could carry `FLAG_FS` and be reported to the UI as `forwardSecret: true` — a
+group-key message wearing a padlock. Rejecting the combination at parse makes
+the flag and the key agree by construction rather than by two call sites
+remembering to.
 
 Preambles are **conditional** rather than fixed header fields: a beacon should
 not pay 36 bytes for machinery it cannot use, on a radio where a legacy
@@ -695,10 +715,10 @@ Two build choices worth stating:
 
 ## 8. Test coverage today
 
-123 tests, all runnable on a laptop with no device, all enforced by CI
+129 tests, all runnable on a laptop with no device, all enforced by CI
 (`.github/workflows/meshcore.yml`).
 
-- **103 Rust core + 6 FFI** (`cargo test`):
+- **109 Rust core + 6 FFI** (`cargo test`):
   - *crypto* — AEAD tamper and wrong-AAD rejection, Ed25519↔X25519 agreement in
     both directions, malformed peer ids refused at decode, **small-order peer
     ids refused at DH** (the vulnerability §5a describes), FS key agreement
@@ -712,6 +732,8 @@ Two build choices worth stating:
     **deriving without committing leaving the chain untouched** (the forged-index
     DoS), the skip cache bounded, a replayed older distribution unable to rewind
     a chain, a restarting peer not accumulating chains, unknown chains unopenable,
+    a newer session superseding a higher generation from an older one, and only
+    a higher generation within a session,
     a chain due only after its interval (and never after a backwards clock jump),
     a rotated chain unreachable from the old one, chain rotation tied to prekey
     rotation.
@@ -722,9 +744,11 @@ Two build choices worth stating:
   - *frame* — broadcast/directed/FS/sender-key roundtrips, relay preserves
     authenticity, **every** authenticated header byte flipped one at a time, both
     preambles authenticated byte by byte, a rotated-out prekey cannot open the
-    frame, a truncated preamble of either kind rejected structurally, a frame
+    frame, **the nickname authenticated byte by byte**, **an FS preamble on a
+    broadcast and a sender-key preamble on a directed frame both refused**,
+    a truncated preamble of either kind rejected structurally, a frame
     claiming both preambles refused, a distribution frame is a distinct kind and
-    never broadcast, multibyte nickname truncation, v1–v3 frames rejected rather
+    never broadcast, multibyte nickname truncation, v1–v4 frames rejected rather
     than misparsed, a maximal frame fits the ceiling exactly.
   - *replay* — in-order, exact replay, reordering inside the window,
     beyond-window rejection, a >64 jump that would be a shift overflow, restart
@@ -745,7 +769,8 @@ Two build choices worth stating:
     decode, **the sender chain rotates without losing a message or downgrading**,
     **a dropped sender-key distribution is retried**, those retries stay
     invisible to the user, and **a relay carries a frame to a peer that only
-    arrives later**, **nodes on different channels cannot see each other** and
+    arrives later**, **a restarted peer can replace the prekey we hold**,
+    **nodes on different channels cannot see each other** and
     nodes sharing one form a single mesh.
   - *relaycache* — carried frames returned on discovery, hand-off destructive so
     each relay forwards once, the same frame held only once however many
@@ -794,6 +819,23 @@ failed on 0.1.97 in CI over a style lint that had been broadened in between.
 toolchain would make the two agree, at the cost of never seeing new lints.
 
 ## 9. What is scaffolding, and what to do next
+
+An adversarial audit of the merged tree (six dimensions, findings verified by
+re-deriving them against the code rather than trusting the report) turned up six
+defects, all now fixed and regression-tested:
+
+| # | defect | where |
+|---|---|---|
+| 1 | nickname outside the AAD — a verified peer's display name was rewritable by anyone in range | `frame.rs` |
+| 2 | prekey ordering by generation alone — a restarted peer could never replace the prekey we held, blackholing traffic to them for minutes | `lib.rs`, `prekey.rs` |
+| 3 | `forwardSecret` derived from preamble presence, not the key actually used | `frame.rs` |
+| 4 | `invalidate()` left `handle_` dangling; every JSI host function then used it after free | `MeshCoreHostObject.cpp` |
+| 5 | `~jsi::Function` run off the JS thread during teardown | `MeshCoreHostObject.cpp` |
+| 6 | `mesh_core_new` failure path released the iOS radio twice | `c_api.rs`, `MeshCoreModule.mm` |
+
+Worth noting what that says about the process, not just the code: 1–3 were in
+pure Rust with 100+ passing tests over it, and 4–6 were in the layers CI never
+compiles. Self-review had signed off on all of them across several increments.
 
 Honest inventory of what is *not* production-ready:
 

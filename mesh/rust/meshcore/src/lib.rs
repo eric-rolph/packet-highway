@@ -790,14 +790,21 @@ impl Worker {
                 // The bundle is signature-checked against the sender's Ed25519
                 // id inside parse_bundle, so a mesh member cannot advertise a
                 // prekey under someone else's name and collect their mail.
-                if let Some(bundle) = prekey::parse_bundle(&parsed.sender, &plaintext) {
+                // The epoch comes from the authenticated header, so it orders
+                // bundles across the peer's restarts — without it, generations
+                // restart at 0 and a rebooted peer can never replace the prekey
+                // we hold, which blackholes everything we send them until we
+                // happen to pass their old generation again.
+                if let Some(bundle) = prekey::parse_bundle(&parsed.sender, parsed.epoch, &plaintext)
+                {
                     let entry = self.peer_prekeys.entry(parsed.sender);
                     let installed = match entry {
                         std::collections::hash_map::Entry::Occupied(mut o) => {
-                            // Only move forward. Accepting an older generation
-                            // would let a captured beacon pin a peer to a
-                            // prekey whose secret is closer to expiry.
-                            if bundle.generation > o.get().generation {
+                            // Only move forward, on (epoch, generation). A newer
+                            // session always wins; within one session a captured
+                            // beacon still cannot pin a peer to an older prekey
+                            // whose secret is closer to expiry.
+                            if bundle.supersedes(o.get()) {
                                 o.insert(bundle);
                                 true
                             } else {
@@ -1923,6 +1930,85 @@ mod tests {
             "out-of-order arrival must not cost a message"
         );
         assert_eq!(b.sink.fs_flags(), vec![true; 3]);
+    }
+
+    /// End to end: Bob restarts with the same persisted identity, so his prekey
+    /// generations start over at 0. Before the epoch was part of the ordering,
+    /// Alice refused every post-restart bundle and kept sealing to a prekey Bob
+    /// had already zeroized — a silent one-way blackhole for minutes.
+    #[test]
+    fn a_restarted_peer_can_replace_the_prekey_we_hold() {
+        let a = node("alice", 1);
+        a.core.start_broadcasting().unwrap();
+        settle();
+
+        let bob = Identity::from_seed([2u8; 32]);
+
+        // Bob's long-running session: a beacon at a high generation.
+        let mut old_ring = PrekeyRing::new(0).unwrap();
+        for i in 1..=5u64 {
+            old_ring.rotate(i).unwrap();
+        }
+        let beacon = |ring: &PrekeyRing, epoch: u64, counter: u64, msg_id: [u8; 16]| {
+            frame::build(
+                &bob,
+                &frame::Outgoing {
+                    recipient: crypto::BROADCAST_ID,
+                    msg_id,
+                    epoch,
+                    counter,
+                    ttl: 1,
+                    body: &ring.bundle(&bob),
+                    nickname: "bob",
+                    kind: FrameKind::Beacon,
+                    sealing: frame::Sealing::Network { key: open_key() },
+                },
+            )
+            .unwrap()
+        };
+
+        a.core
+            .ingest(-40, &beacon(&old_ring, 100, 0, [1u8; 16]))
+            .unwrap();
+        settle();
+
+        // Bob reboots: same identity, fresh ring at generation 0, later epoch.
+        let new_ring = PrekeyRing::new(0).unwrap();
+        assert_eq!(new_ring.current().generation, 0, "precondition");
+        a.core
+            .ingest(-40, &beacon(&new_ring, 101, 0, [2u8; 16]))
+            .unwrap();
+        settle();
+        a.radio.drain();
+
+        // Alice must now seal to Bob's *live* prekey, which only he can open.
+        a.core
+            .send_message(Some(bob.public_id()), b"after your reboot")
+            .unwrap();
+        settle();
+
+        // ParsedFrame borrows the wire buffer, so keep the buffers alive and
+        // parse inside the loop rather than carrying parsed frames out of it.
+        let opened = a.radio.drain().into_iter().any(|w| {
+            let Ok(p) = frame::parse(&w) else {
+                return false;
+            };
+            if p.kind != FrameKind::Message || !p.is_forward_secret() {
+                return false;
+            }
+            frame::open(
+                &bob,
+                &p,
+                frame::Opening::ForwardSecret {
+                    prekey_secret: new_ring.current().secret(),
+                },
+            )
+            .is_ok()
+        });
+        assert!(
+            opened,
+            "Alice must seal to the prekey Bob actually holds after restarting"
+        );
     }
 
     /// A peer that impersonates another in a beacon must not be able to install

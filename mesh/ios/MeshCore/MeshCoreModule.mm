@@ -102,11 +102,10 @@ RCT_EXPORT_BLOCKING_SYNCHRONOUS_METHOD(initializeCore
   MeshHandle *handle = NULL;
   MeshStatus st = mesh_core_new(&cfg, vtable, &handle);
   if (st != MESH_STATUS_OK || handle == NULL) {
-    // Rust never took the vtable, so the CFBridgingRetain in +vtableForRadio:
-    // is ours to balance.
-    if (vtable.destroy != NULL) {
-      vtable.destroy(vtable.ctx);
-    }
+    // Do NOT call vtable.destroy here. mesh_core_new consumes the vtable
+    // unconditionally — on the failure paths it has already dropped its
+    // Arc<CRadio>, which ran destroy() and balanced the CFBridgingRetain from
+    // +vtableForRadio:. Releasing again would over-release _radio.
     _radio = nil;
     @throw [NSException exceptionWithName:@"MeshCoreInitFailed"
                                    reason:[NSString stringWithFormat:@"mesh_core_new: %d", (int)st]

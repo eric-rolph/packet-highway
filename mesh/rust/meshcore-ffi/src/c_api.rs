@@ -337,6 +337,14 @@ pub extern "C" fn mesh_abi_version() -> u32 {
 /// Create a core. On success `*out` receives an owning pointer that must be
 /// released with `mesh_core_free`.
 ///
+/// **This call consumes `radio` unconditionally.** Whether it succeeds or
+/// fails, `radio.destroy(radio.ctx)` will have been invoked exactly once by the
+/// time it returns, so the caller must never invoke it themselves. The rule is
+/// blunt on purpose: the previous contract ("Rust never took the vtable on
+/// failure") was true only for the two argument-validation returns, and a
+/// caller balancing its own retain on a `CoreError` path released the radio a
+/// second time.
+///
 /// # Safety
 /// `config` must be valid; `radio.ctx` must outlive the core (or be managed by
 /// `radio.destroy`); `out` must be a valid writable pointer.
@@ -347,6 +355,11 @@ pub unsafe extern "C" fn mesh_core_new(
     out: *mut *mut MeshHandle,
 ) -> MeshStatus {
     guard(MeshStatus::Panic, || {
+        // Take ownership before anything that can return early. Every exit path
+        // below now drops this exactly once, which is what makes the
+        // unconditional contract above true rather than aspirational.
+        let radio = Arc::new(CRadio(radio));
+
         if out.is_null() {
             set_last_error("null out pointer");
             return MeshStatus::InvalidArgument;
@@ -390,7 +403,7 @@ pub unsafe extern "C" fn mesh_core_new(
             ..Default::default()
         };
 
-        match MeshHandle::new_internal(core_cfg, Arc::new(CRadio(radio))) {
+        match MeshHandle::new_internal(core_cfg, radio) {
             Ok(handle) => {
                 *out = Box::into_raw(handle);
                 MeshStatus::Ok

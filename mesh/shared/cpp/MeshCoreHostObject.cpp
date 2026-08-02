@@ -45,6 +45,11 @@ MeshCoreHostObject::MeshCoreHostObject(
 
 MeshCoreHostObject::~MeshCoreHostObject() {
   invalidate();
+  // Safe here and only here: the runtime owns this object, so its destructor
+  // runs on the JS thread, which is the only thread allowed to destroy a
+  // jsi::Function. See the note in invalidate().
+  std::lock_guard<std::mutex> lock(listenerMutex_);
+  listener_.reset();
 }
 
 void MeshCoreHostObject::registerEventSink() {
@@ -60,12 +65,27 @@ void MeshCoreHostObject::invalidate() {
     return;  // already invalidated
   }
   // Order matters: unregister first (this blocks until any in-flight event
-  // callback has returned), then drop the JS function reference.
+  // callback has returned), then forget the handle.
   if (handle_ != nullptr) {
     mesh_core_set_event_sink(handle_, nullptr, nullptr);
   }
-  std::lock_guard<std::mutex> lock(listenerMutex_);
-  listener_.reset();
+  // MUST null the handle, not merely flip valid_. Both platform modules call
+  // invalidate() and then immediately free the core, but the JS runtime still
+  // owns this object through `global.__MeshCore` and can keep calling in — a UI
+  // polling `pendingCount` on a timer is the obvious case, and c_api.rs invites
+  // exactly that. Every host function below would then dereference freed
+  // memory. The Rust side already null-checks every entry point (the `handle!`
+  // macro returns MESH_STATUS_NULL_HANDLE, and the accessors return 0/false),
+  // so this one store turns a use-after-free into a defined no-op.
+  handle_ = nullptr;
+
+  // `listener_` is deliberately NOT reset here. It holds a jsi::Function, and
+  // ~jsi::Function mutates the runtime's managed-value list — which is only
+  // legal on the JS thread. invalidate() is called from the platform module's
+  // thread (RN's method queue on iOS, the UI thread on Android), so dropping it
+  // here would race Hermes' internal free list and corrupt the heap. The
+  // destructor does it instead: this object is owned by the runtime, so
+  // ~MeshCoreHostObject runs on the JS thread by construction.
 }
 
 // ---------------------------------------------------------------------------
