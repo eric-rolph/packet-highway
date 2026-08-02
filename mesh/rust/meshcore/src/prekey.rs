@@ -84,6 +84,27 @@ impl std::fmt::Debug for PrekeyPair {
 pub struct PeerPrekey {
     pub generation: u32,
     pub public: [u8; 32],
+    /// The sender's session epoch, taken from the authenticated frame header.
+    ///
+    /// Generations restart at 0 on every launch, so `generation` alone is not
+    /// ordered across a restart: a peer that reboots advertises generation 0
+    /// while we still hold generation 40, and a naive "only move forward" rule
+    /// pins us to a prekey whose secret they destroyed on exit. The epoch is
+    /// what makes the pair orderable — the same field, and the same reason,
+    /// that `replay.rs` uses to survive a counter reset.
+    pub epoch: u64,
+}
+
+impl PeerPrekey {
+    /// Whether `self` describes a strictly newer prekey than `other`.
+    ///
+    /// Lexicographic on `(epoch, generation)`: a newer session always wins
+    /// regardless of how far its generation counter has got, and within one
+    /// session the generation still only moves forward — so a captured beacon
+    /// cannot pin a peer back to an older, closer-to-expiry prekey.
+    pub fn supersedes(&self, other: &PeerPrekey) -> bool {
+        (self.epoch, self.generation) > (other.epoch, other.generation)
+    }
 }
 
 /// Our own ring of prekeys.
@@ -165,7 +186,7 @@ impl PrekeyRing {
 /// not optional: beacons are sealed with the shared network key, so without a
 /// signature any member could advertise a prekey under another member's id and
 /// receive their directed mail.
-pub fn parse_bundle(peer: &PeerId, body: &[u8]) -> Option<PeerPrekey> {
+pub fn parse_bundle(peer: &PeerId, epoch: u64, body: &[u8]) -> Option<PeerPrekey> {
     if body.len() != BUNDLE_LEN {
         return None;
     }
@@ -175,8 +196,11 @@ pub fn parse_bundle(peer: &PeerId, body: &[u8]) -> Option<PeerPrekey> {
     let mut signature = [0u8; SIGNATURE_LEN];
     signature.copy_from_slice(&body[36..BUNDLE_LEN]);
 
-    crypto::verify_prekey(peer, generation, &public, &signature)
-        .then_some(PeerPrekey { generation, public })
+    crypto::verify_prekey(peer, generation, &public, &signature).then_some(PeerPrekey {
+        generation,
+        public,
+        epoch,
+    })
 }
 
 #[cfg(test)]
@@ -247,9 +271,53 @@ mod tests {
         let body = ring.bundle(&id);
         assert_eq!(body.len(), BUNDLE_LEN);
 
-        let parsed = parse_bundle(&id.public_id(), &body).expect("own bundle must verify");
+        let parsed = parse_bundle(&id.public_id(), 1, &body).expect("own bundle must verify");
         assert_eq!(parsed.generation, ring.current().generation);
         assert_eq!(parsed.public, ring.current().public);
+    }
+
+    /// The restart blackhole. Generations restart at 0, so ordering on
+    /// generation alone means a rebooted peer can never replace the prekey we
+    /// hold — and everything we send them is sealed to a secret they destroyed.
+    #[test]
+    fn a_newer_session_supersedes_a_higher_generation_from_an_older_one() {
+        let long_running = PeerPrekey {
+            generation: 40,
+            public: [1u8; 32],
+            epoch: 100,
+        };
+        let after_restart = PeerPrekey {
+            generation: 0,
+            public: [2u8; 32],
+            epoch: 101,
+        };
+        assert!(
+            after_restart.supersedes(&long_running),
+            "a fresh session must win however low its generation counter is"
+        );
+        assert!(!long_running.supersedes(&after_restart));
+    }
+
+    /// Within one session the old rule still holds, or a captured beacon could
+    /// pin a peer back to a prekey closer to being destroyed.
+    #[test]
+    fn within_a_session_only_a_higher_generation_supersedes() {
+        let base = PeerPrekey {
+            generation: 7,
+            public: [1u8; 32],
+            epoch: 100,
+        };
+        let newer = PeerPrekey {
+            generation: 8,
+            ..base
+        };
+        let older = PeerPrekey {
+            generation: 6,
+            ..base
+        };
+        assert!(newer.supersedes(&base));
+        assert!(!older.supersedes(&base));
+        assert!(!base.supersedes(&base), "equal is not newer");
     }
 
     #[test]
@@ -259,7 +327,7 @@ mod tests {
         let ring = PrekeyRing::new(0).unwrap();
         let body = ring.bundle(&alice);
         // The exact impersonation the signature exists to stop.
-        assert!(parse_bundle(&bob.public_id(), &body).is_none());
+        assert!(parse_bundle(&bob.public_id(), 1, &body).is_none());
     }
 
     #[test]
@@ -272,12 +340,12 @@ mod tests {
             let mut bad = good.clone();
             bad[offset] ^= 0xff;
             assert!(
-                parse_bundle(&id.public_id(), &bad).is_none(),
+                parse_bundle(&id.public_id(), 1, &bad).is_none(),
                 "flipping byte {offset} of a bundle went undetected"
             );
         }
         // Wrong length, including empty and truncated.
-        assert!(parse_bundle(&id.public_id(), &[]).is_none());
-        assert!(parse_bundle(&id.public_id(), &good[..BUNDLE_LEN - 1]).is_none());
+        assert!(parse_bundle(&id.public_id(), 1, &[]).is_none());
+        assert!(parse_bundle(&id.public_id(), 1, &good[..BUNDLE_LEN - 1]).is_none());
     }
 }

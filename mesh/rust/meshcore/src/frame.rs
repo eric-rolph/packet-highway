@@ -1,4 +1,4 @@
-//! Wire format v4.
+//! Wire format v5.
 //!
 //! One fixed-size header, at most one key-agreement preamble, an optional
 //! nickname, then AEAD ciphertext. Everything is little-endian (both mobile
@@ -41,9 +41,15 @@
 //!
 //! `ttl`/`hops` are deliberately outside the AAD: a relay must be able to
 //! decrement TTL without holding a key. **Everything else is inside it** —
-//! including `epoch`, `counter` and the FS preamble — which is what makes the
-//! anti-replay window trustworthy and stops an attacker re-pointing a frame at
-//! a different prekey.
+//! header, whichever preamble is present, and the nickname — which is what
+//! makes the anti-replay window trustworthy, stops an attacker re-pointing a
+//! frame at a different prekey, and stops one rewriting the display name a
+//! verified peer appears under.
+//!
+//! The nickname sits in the AAD rather than the ciphertext because a relay has
+//! no key and must still be able to forward the frame byte-for-byte. It is
+//! therefore authenticated but **not confidential**: anyone in radio range can
+//! read it, they simply cannot change it.
 
 use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -53,7 +59,7 @@ use crate::senderkey;
 use crate::CoreError;
 
 pub const MAGIC: u8 = 0x4D;
-pub const VERSION: u8 = 4;
+pub const VERSION: u8 = 5;
 pub const HEADER_LEN: usize = 116;
 pub const MAX_NICKNAME: usize = 20;
 
@@ -87,7 +93,11 @@ pub const FLAG_SKDM: u8 = 0b0001_0000;
 const OFF_TTL: usize = 3;
 const OFF_HOPS: usize = 4;
 
-const MAX_AAD_LEN: usize = HEADER_LEN + FS_PREAMBLE_LEN;
+/// The AAD spans the header, whichever preamble is present, **and the
+/// nickname**. The nickname was outside it until v5, which meant anyone who
+/// could hear a frame could rewrite the display name of a cryptographically
+/// authenticated peer and have it accepted — see `the_nickname_is_authenticated`.
+const MAX_AAD_LEN: usize = HEADER_LEN + FS_PREAMBLE_LEN + MAX_NICKNAME;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FrameError {
@@ -96,6 +106,11 @@ pub enum FrameError {
     UnsupportedVersion(u8),
     LengthMismatch,
     BadNickname,
+    /// A forward-secrecy preamble on a broadcast, or a sender-key preamble on a
+    /// directed frame. Each names a key agreement that does not exist for that
+    /// recipient, and accepting one would let the frame claim a guarantee the
+    /// opening path does not provide.
+    PreambleKindMismatch,
     /// Both preamble bits set. They imply different lengths and different key
     /// agreements; rather than pick one, refuse the frame.
     ConflictingPreambles,
@@ -236,6 +251,20 @@ pub fn parse(buf: &[u8]) -> Result<ParsedFrame<'_>, FrameError> {
     if has_fs && has_sk {
         return Err(FrameError::ConflictingPreambles);
     }
+    // Which preamble is present must agree with who the frame is addressed to.
+    // Without this the flag and the key disagree: `unseal` picks the opening key
+    // from the recipient, so a broadcast carrying FLAG_FS is opened with the
+    // channel key while `is_forward_secret()` — which only looks at the
+    // preambles — reports true. That is a group-key message wearing a padlock.
+    // Rejecting the combination makes the two agree by construction rather than
+    // by two call sites remembering to.
+    let is_broadcast = buf[56..88] == crypto::BROADCAST_ID;
+    if has_fs && is_broadcast {
+        return Err(FrameError::PreambleKindMismatch);
+    }
+    if has_sk && !is_broadcast {
+        return Err(FrameError::PreambleKindMismatch);
+    }
     let preamble_len = match (has_fs, has_sk) {
         (true, _) => FS_PREAMBLE_LEN,
         (_, true) => SK_PREAMBLE_LEN,
@@ -293,7 +322,7 @@ pub fn parse(buf: &[u8]) -> Result<ParsedFrame<'_>, FrameError> {
         FrameKind::Message
     };
 
-    let (aad_buf, aad_len) = make_aad(&buf[..HEADER_LEN + preamble_len]);
+    let (aad_buf, aad_len) = make_aad(&buf[..nick_start + nick_len]);
 
     Ok(ParsedFrame {
         sender,
@@ -415,10 +444,12 @@ pub fn build(identity: &Identity, out: &Outgoing<'_>) -> Result<Vec<u8>, CoreErr
 
     buf.extend_from_slice(&preamble[..preamble_len]);
 
+    // The nickname goes on *before* the AAD snapshot: it is authenticated data,
+    // and appending it afterwards is exactly the bug v5 fixes.
+    buf.extend_from_slice(nick);
     // AAD is derived from the bytes just written, with ttl/hops zeroed, so seal
     // and open compute byte-identical AAD.
     let (aad_buf, aad_len) = make_aad(&buf);
-    buf.extend_from_slice(nick);
     buf.extend_from_slice(&crypto::seal_aead(
         &key,
         &nonce,
@@ -542,6 +573,7 @@ mod tests {
         let bundle = PeerPrekey {
             generation: ring.current().generation,
             public: ring.current().public,
+            epoch: 1,
         };
         let ephemeral = crypto::random_secret().unwrap();
 
@@ -584,6 +616,7 @@ mod tests {
         let bundle = PeerPrekey {
             generation: ring.current().generation,
             public: ring.current().public,
+            epoch: 1,
         };
         let ephemeral = crypto::random_secret().unwrap();
         let wire = build(
@@ -627,6 +660,7 @@ mod tests {
         let bundle = PeerPrekey {
             generation: ring.current().generation,
             public: ring.current().public,
+            epoch: 1,
         };
         let ephemeral = crypto::random_secret().unwrap();
         let wire = build(
@@ -872,7 +906,7 @@ mod tests {
         assert!(p.nickname.starts_with("alice"));
 
         let body = open(&b, &p, Opening::Network { key: open_key() }).unwrap();
-        let peer_prekey = crate::prekey::parse_bundle(&a.public_id(), &body).unwrap();
+        let peer_prekey = crate::prekey::parse_bundle(&a.public_id(), 1, &body).unwrap();
         assert_eq!(peer_prekey.public, ring.current().public);
     }
 
@@ -915,15 +949,86 @@ mod tests {
     #[test]
     fn a_truncated_fs_preamble_is_rejected() {
         let a = Identity::from_seed([1u8; 32]);
-        let wire = build(&a, &broadcast(b"x")).unwrap();
+        let b = Identity::from_seed([2u8; 32]);
+        // Directed, because an FS preamble on a broadcast is now refused for a
+        // different reason and would not exercise the length check.
+        let wire = build(&a, &directed(b.public_id(), b"x", Sealing::Static)).unwrap();
         let mut lying = wire[..HEADER_LEN + 4].to_vec();
         lying[2] |= FLAG_FS;
         assert_eq!(parse(&lying).unwrap_err(), FrameError::TooShort);
     }
 
+    /// The v5 fix. Until then the nickname sat outside the AAD, so anyone in
+    /// radio range could rewrite the display name of a peer whose identity was
+    /// cryptographically verified, and the AEAD would still pass.
+    #[test]
+    fn the_nickname_is_authenticated() {
+        let a = Identity::from_seed([1u8; 32]);
+        let b = Identity::from_seed([2u8; 32]);
+        let wire = build(
+            &a,
+            &Outgoing {
+                recipient: crypto::BROADCAST_ID,
+                msg_id: [1u8; 16],
+                epoch: 1,
+                counter: 0,
+                ttl: 1,
+                body: b"x",
+                nickname: "alice",
+                kind: FrameKind::Beacon,
+                sealing: Sealing::Network { key: open_key() },
+            },
+        )
+        .unwrap();
+        assert_eq!(parse(&wire).unwrap().nickname, "alice");
+
+        // Same length, so nick_len in the authenticated header is untouched.
+        for offset in 0..5 {
+            let mut tampered = wire.clone();
+            tampered[HEADER_LEN + offset] ^= 0x20;
+            let p = parse(&tampered).unwrap();
+            assert!(
+                open(&b, &p, Opening::Network { key: open_key() }).is_err(),
+                "rewriting nickname byte {offset} went undetected"
+            );
+        }
+    }
+
+    /// A broadcast has no per-recipient exchange, so an FS preamble on one names
+    /// a key agreement that cannot exist. Accepting it let the frame report
+    /// `forwardSecret: true` while being opened with the channel key.
+    #[test]
+    fn a_forward_secret_preamble_on_a_broadcast_is_refused() {
+        let a = Identity::from_seed([1u8; 32]);
+        let wire = build(&a, &broadcast(b"x")).unwrap();
+        let mut lying = wire[..HEADER_LEN].to_vec();
+        lying[2] |= FLAG_FS;
+        lying.extend_from_slice(&[0u8; FS_PREAMBLE_LEN]);
+        lying.extend_from_slice(&wire[HEADER_LEN..]);
+        assert_eq!(
+            parse(&lying).unwrap_err(),
+            FrameError::PreambleKindMismatch,
+            "a group-key broadcast must not be able to claim forward secrecy"
+        );
+    }
+
+    /// The mirror: a sender chain is a broadcast construct, so an SK preamble on
+    /// a directed frame would be opened static-static while claiming FS.
+    #[test]
+    fn a_sender_key_preamble_on_a_directed_frame_is_refused() {
+        let a = Identity::from_seed([1u8; 32]);
+        let b = Identity::from_seed([2u8; 32]);
+        let wire = build(&a, &directed(b.public_id(), b"x", Sealing::Static)).unwrap();
+        let mut lying = wire[..HEADER_LEN].to_vec();
+        lying[2] |= FLAG_SK;
+        lying.extend_from_slice(&[0u8; SK_PREAMBLE_LEN]);
+        lying.extend_from_slice(&wire[HEADER_LEN..]);
+        assert_eq!(parse(&lying).unwrap_err(), FrameError::PreambleKindMismatch);
+    }
+
     #[test]
     fn older_wire_versions_are_rejected() {
-        for old in [1u8, 2, 3] {
+        for old in [1u8, 2, 3, 4] {
             let mut v = vec![0u8; 200];
             v[0] = MAGIC;
             v[1] = old;
@@ -942,6 +1047,7 @@ mod tests {
         let bundle = PeerPrekey {
             generation: ring.current().generation,
             public: ring.current().public,
+            epoch: 1,
         };
         let ephemeral = crypto::random_secret().unwrap();
         let body = vec![0xAAu8; MAX_BODY];
