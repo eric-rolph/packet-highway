@@ -1,0 +1,3 @@
+# Exclude standalone mesh/ prototype from GitHub Linguist language stats
+# so packet-highway is properly indexed as a Python + JavaScript project.
+mesh/** linguist-vendored
