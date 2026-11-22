@@ -170,8 +170,10 @@ def summarize_packet(pkt: Packet, pid: int, ref_ips: set[str]) -> dict | None:
             flags = str(l4.flags)
             seq = int(l4.seq)
             plen = len(l4.payload)
-            if plen > 50 and 443 in (sport, dport):
-                sni = _extract_sni(bytes(l4.payload))
+            if plen > 50:
+                raw_payload = bytes(l4.payload)
+                if raw_payload[0] == 0x16:
+                    sni = _extract_sni(raw_payload)
         elif isinstance(l4, UDP):
             transport = "UDP"
             sport, dport = int(l4.sport), int(l4.dport)

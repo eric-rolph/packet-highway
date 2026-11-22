@@ -84,8 +84,8 @@ async def api_pcap(
             size += len(chunk)
             if size > MAX_UPLOAD:
                 return JSONResponse({"error": "File exceeds 250 MB limit."}, status_code=413)
-            tmp.write(chunk)
-        tmp.close()
+            await asyncio.to_thread(tmp.write, chunk)
+        await asyncio.to_thread(tmp.close)
         if size == 0:
             return JSONResponse({"error": "Empty file."}, status_code=400)
         try:
