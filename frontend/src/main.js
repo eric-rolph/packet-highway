@@ -11,7 +11,7 @@ import { StatsEngine } from './stats.js';
 import { FlowTracker } from './flows.js';
 import { DnsTracker } from './dns.js';
 import { Playback } from './playback.js';
-import { LiveSource, fetchInterfaces, fetchSample, uploadPcap } from './sources.js';
+import { LiveSource, fetchInterfaces, fetchSample, uploadPcap, isBrowserStandalone } from './sources.js';
 import { computeBuckets } from './histogram.js';
 import { UI, fmtDur } from './ui.js';
 
@@ -60,9 +60,11 @@ function resetWorld() {
 const live = new LiveSource({
   onHello: (msg) => {
     ui.setCaptureState(true);
-    ui.toast(msg.mode === 'demo'
-      ? 'Demo traffic stream started — synthetic packets, no capture needed.'
-      : `Capturing on ${msg.iface ?? 'default interface'}${msg.bpf ? ` (filter: ${msg.bpf})` : ''}`,
+    ui.toast(msg.browserOnly
+      ? 'Browser Demo Mode — live synthetic highway running locally. Switch to PCAP to inspect your own .pcap/.pcapng privately in-browser!'
+      : msg.mode === 'demo'
+        ? 'Demo traffic stream started — synthetic packets, no capture needed.'
+        : `Capturing on ${msg.iface ?? 'default interface'}${msg.bpf ? ` (filter: ${msg.bpf})` : ''}`,
       'success');
   },
   onPackets: (items, dropped) => {
@@ -226,10 +228,18 @@ ui.setMode('live');
 (function loadInterfaces(attempt = 0) {
   fetchInterfaces()
     .then((list) => {
-      if (list.length) ui.fillInterfaces(list);
-      else if (attempt < 5) setTimeout(() => loadInterfaces(attempt + 1), 1500);
+      if (list.length) {
+        ui.fillInterfaces(list);
+      } else if (isBrowserStandalone()) {
+        // Static host (e.g., GitHub Pages): auto-start synthetic highway demo immediately!
+        if (!live.running && mode === 'live') live.start({ demo: true });
+      } else if (attempt < 2) {
+        setTimeout(() => loadInterfaces(attempt + 1), 1200);
+      }
     })
-    .catch(() => { if (attempt < 5) setTimeout(() => loadInterfaces(attempt + 1), 1500); });
+    .catch(() => {
+      if (isBrowserStandalone() && !live.running && mode === 'live') live.start({ demo: true });
+    });
 })();
 
 // ------------------------------------------------------------ render loop

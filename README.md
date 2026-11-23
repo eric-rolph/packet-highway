@@ -1,5 +1,12 @@
 # Packet Highway
 
+[![CI](https://github.com/eric-rolph/packet-highway/actions/workflows/ci.yml/badge.svg)](https://github.com/eric-rolph/packet-highway/actions/workflows/ci.yml)
+[![Live 3D Demo](https://img.shields.io/badge/Live%20Demo-GitHub%20Pages-38bdf8?logo=github)](https://eric-rolph.github.io/packet-highway/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-34d399)](LICENSE)
+
+> **Try it now with zero install:** [**Launch the Live 3D Packet Highway Demo →**](https://eric-rolph.github.io/packet-highway/)  
+> Runs synthetic traffic live in Three.js, and lets you open your own `.pcap` / `.pcapng` Wireshark captures **100% locally in your browser** (parsed client-side, never uploaded).
+
 <a href="https://youtu.be/yY2ITK-Wm18" target="_blank">
   <img src="https://img.youtube.com/vi/yY2ITK-Wm18/maxresdefault.jpg" alt="Watch the video" width="600" />
 </a>
